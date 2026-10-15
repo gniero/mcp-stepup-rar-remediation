@@ -76,14 +76,18 @@ cp .env.example .env     # coloque sua ANTHROPIC_API_KEY nele
 | `auth.ts` | Valida os JWTs (iss, aud, assinatura) em toda requisição. Um token é ou um **token de sessão** (`mcp:basic`) ou um **token de uso único** (somente `authorization_details`). Também monta o desafio de remediação: `401`, `error="insufficient_authorization"`, `error_description` e `authorization_remediation=<JSON em base64url>` com os `authorization_details`. **Não há `authorization_reference`**, porque o draft manda omiti-lo para tokens de uso único. O `resource_metadata` é incluído para que o cliente encontre o AS. |
 | `stepup.ts` | `requireAuthorizationDetails(extra, detalhe(s))` só passa se o token tiver detalhes idênticos e seu `jti` ainda não tiver sido consumido. Caso contrário, registra um desafio e interrompe a ferramenta. `commit()` envolve os efeitos colaterais; o **guard** se recusa a desafiar depois de um commit. `consumeToken()` invalida o token de uso único quando a operação é efetivada. |
 | `operations.ts` | Armazenamento de operações pendentes, indexado por `(Mcp-Session-Id, id JSON-RPC)`: checkpoint, status, resultado armazenado, TTL. |
-| `tools.ts` | `transfer`: valida (somente leitura), cria `op_X`, faz a **elicitation** de confirmação e então exige os detalhes `money_transfer` exatamente desta operação. No reenvio, retoma a partir do checkpoint, revalida, efetiva e invalida o token. `naive_batch_transfer` (demo): com um recebedor novo, cadastra o recebedor primeiro (um commit), então o guard devolve um resultado parcial. Com recebedores conhecidos, desafia uma única vez com **N `authorization_details`**, de modo que um consentimento cobre o lote. |
-| `index.ts` | Modo de resposta JSON. Converte um desafio registrado no 401. Um token de uso único só é aceito em um `tools/call` de pagamento; qualquer outra coisa recebe `403 insufficient_scope`. As sessões ficam vinculadas ao `sub`. |
+| `tools.ts` | `transfer`: localiza a operação por `_meta["lab.stepup/operation_id"]` (nova tentativa in-band) ou por `(sessão, id da requisição)` (reenvio HTTP). Na primeira execução, valida (somente leitura), cria `op_X`, faz a **elicitation** de confirmação e então exige os detalhes `money_transfer` exatamente desta operação. No reenvio, retoma a partir do checkpoint, revalida, efetiva e invalida o token. `naive_batch_transfer` (demo): com um recebedor novo, cadastra o recebedor primeiro (um commit), então o guard devolve um resultado parcial. Com recebedores conhecidos, desafia uma única vez com **N `authorization_details`**, de modo que um consentimento cobre o lote. |
+| `challenge.ts` | A forma **independente de transporte** do desafio: erro JSON-RPC **`AUTHORIZATION_REQUIRED` (-32043)** com `data = {error, error_description, authorization_remediation, resource_metadata, operation_id}`. `bindInband(transport)` envolve qualquer transporte conectado para que um desafio registrado substitua o resultado descartado da ferramenta por esse erro. Também define as chaves `_meta` do laboratório: `lab.stepup/operation_id` (retomar uma operação pendente) e `lab.stepup/access_token` (token de uso único, só em stdio). |
+| `index.ts` | Modo de resposta JSON. Com `CHALLENGE_BINDING=http` (padrão), converte um desafio registrado no 401. O corpo do 401/403 é **RFC 9457 (problem details), não uma resposta JSON-RPC**: um desafio de transporte deixa a requisição sem resposta, então reenviar o mesmo id é legítimo. Com `CHALLENGE_BINDING=inband`, aplica o `bindInband`. Um token de uso único só é aceito em um `tools/call` de pagamento; qualquer outra coisa recebe `403 insufficient_scope`. As sessões ficam vinculadas ao `sub`. |
+| `stdio.ts` | O mesmo servidor via **stdio**. O token de sessão vem de `MCP_ACCESS_TOKEN`, os desafios são sempre in-band e o token de uso único chega em `_meta`. |
+| `stdio-probe.ts` | Demonstração via stdio sem navegador: `-32043` → token de uso único → nova tentativa com `_meta` → resultado armazenado na duplicata → token de uso único recusado em ferramenta que não é de pagamento. |
 
 ## Passo 3: o agente (`agent/src`)
 
 | Arquivo | O que faz |
 |---|---|
-| `stepup-fetch.ts` | A metade cliente. **401 / 403 insufficient_scope** → (re)obtém o token de **sessão**, reenvia e continua usando-o. **401 insufficient_authorization** → decodifica o `authorization_remediation`, obtém um token de **uso único**, reenvia **apenas esta requisição** com ele e o descarta. Se o reenvio falhar de novo, o caso não é remediável e o cliente para (draft §7.1 passo 4, §7.3.3). |
+| `stepup-fetch.ts` | A metade cliente. **401 / 403 insufficient_scope** → (re)obtém o token de **sessão**, reenvia e continua usando-o. **401 insufficient_authorization** → decodifica o `authorization_remediation`, obtém um token de **uso único**, reenvia **apenas esta requisição** com ele e o descarta. Se o reenvio falhar de novo, o caso não é remediável e o cliente para (draft §7.1 passo 4, §7.3.3). Se o usuário **recusar** (ou a remediação for impossível), o `tools/call` é respondido localmente com um `CallToolResult` com **`isError: true`** ("o usuário recusou… não tente de novo"), e não com um erro de transporte, então o modelo vê um resultado de ferramenta e não entra em loop. |
+| `inband.ts` | `callToolWithAuthorization()`: ao receber o erro JSON-RPC **-32043**, executa a mesma autorização de uso único e **tenta de novo como um novo `tools/call`** com `_meta["lab.stepup/operation_id"]`. O servidor retoma o checkpoint, sem uma segunda elicitation. O token de uso único é anexado exatamente a essa requisição (`oauth.armOneShot`). Uma recusa também vira um resultado `isError`. |
 | `oauth.ts` | Discovery (PRM → metadados do AS, verificação do issuer, verificação de `authorization_details_types_supported`). O fluxo authorization code + PKCE + `resource` é compartilhado pelo grant de sessão (`scope=…`) e pelo grant de operação (`authorization_details=…`, **sem scope**). O token de sessão nunca é sobrescrito por um token de operação. |
 | `elicitation.ts` | Elicitation de formulário no terminal (`Y/n/c`). |
 | `index.ts` | Loop de tool use com Claude. Declara a capability de elicitation, com timeout de 5 min para requisições retidas. |
@@ -97,6 +101,17 @@ docker compose ps                # idp e mcp-server "healthy"
 
 bash scripts/probe.sh            # prova via HTTP puro, sem LLM
 docker compose run --build --rm --service-ports agent
+```
+
+**Variantes:**
+
+```bash
+# O mesmo fluxo com o binding in-band via HTTP (erro JSON-RPC -32043 em vez de 401):
+CHALLENGE_BINDING=inband docker compose up -d --build mcp-server
+docker compose run --build --rm --service-ports agent
+
+# O mesmo servidor via stdio (lá, in-band é a única opção):
+docker compose run --rm mcp-server node src/stdio-probe.ts
 ```
 
 O `probe.sh` mostra:
@@ -132,6 +147,20 @@ Logs: `docker compose logs -f idp mcp-server` mostra `[consent]`, `[token]` (sco
 7. **Lote.** Uma única remediação pode carregar N `authorization_details`, então um consentimento e um token cobrem N transferências.
 8. **Elicitation versus desafios HTTP.** No modo de resposta JSON, a elicitation precisa trafegar desvinculada da requisição pelo stream GET independente, porque o SDK descarta ali as mensagens do servidor vinculadas à requisição. A elicitation continua sendo só UX; a autorização vem do AS.
 9. **Timeouts.** Uma requisição retida espera por uma pessoa, então o padrão de 60 s do SDK é curto demais.
+
+## Semântica da ferramenta: o que o laboratório faz a respeito
+
+O desafio é modelado como um único resultado abstrato: **"autorização necessária para estes `authorization_details`; nada foi executado"**. Cada transporte o carrega à sua maneira:
+
+| | Binding HTTP (`401`) | Binding in-band (`-32043`) |
+|---|---|---|
+| A requisição JSON-RPC foi respondida? | **Não.** O corpo é problem details, não uma resposta JSON-RPC | **Sim**, com um erro JSON-RPC |
+| Como o cliente continua | Reenvia a **mesma** requisição (mesmo id, mesma sessão) | Envia um **novo** `tools/call` com `_meta["lab.stepup/operation_id"]` |
+| Como o servidor retoma | Operação pendente indexada por `(sessão, id da requisição)` | Operação pendente localizada pelo id da operação |
+| Onde vai o token de uso único | Header `Authorization` | Header `Authorization` (HTTP) ou `_meta["lab.stepup/access_token"]` (stdio) |
+| Transportes | Só Streamable HTTP | Qualquer um (HTTP, stdio) |
+
+Nos dois bindings, **uma recusa do usuário é um resultado de ferramenta** (`isError: true`), e o guard mantém a promessa de que "nada foi executado". O código `-32043` e as chaves `_meta` são definidos pelo laboratório, inspirados no `-32042` da especificação (URL elicitation required). Padronizá-los faz parte da proposta.
 
 ## Solução de problemas
 

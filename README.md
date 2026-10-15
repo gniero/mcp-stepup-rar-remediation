@@ -76,14 +76,18 @@ cp .env.example .env     # put your ANTHROPIC_API_KEY in it
 | `auth.ts` | Validates JWTs (iss, aud, signature) on every request. A token is either a **session token** (`mcp:basic`) or a **one-shot token** (only `authorization_details`). It also builds the remediation challenge: `401`, `error="insufficient_authorization"`, `error_description`, and `authorization_remediation=<base64url JSON>` with `authorization_details`. There's **no `authorization_reference`**, because the draft says to omit it for single-use tokens. `resource_metadata` is added so the client can find the AS. |
 | `stepup.ts` | `requireAuthorizationDetails(extra, detail(s))` passes only if the token carries equal details and its `jti` hasn't been consumed. Otherwise it records a challenge and aborts the tool. `commit()` wraps side effects; the **guard** refuses to challenge after a commit. `consumeToken()` burns the one-shot token once the operation commits. |
 | `operations.ts` | Pending-operation store keyed by `(Mcp-Session-Id, JSON-RPC id)`: checkpoint, status, stored result, TTL. |
-| `tools.ts` | `transfer`: validates (read-only), creates `op_X`, **elicits** confirmation, then requires the `money_transfer` details for exactly this operation. On replay it resumes from the checkpoint, re-validates, commits and burns the token. `naive_batch_transfer` (demo): with a new payee it registers the payee first (a commit), so the guard returns a partial result. With known payees it challenges once with **N `authorization_details`**, so one consent covers the batch. |
-| `index.ts` | JSON response mode. Rewrites a recorded challenge into the 401. A one-shot token is accepted only for a payment `tools/call`; anything else gets `403 insufficient_scope`. Sessions are bound to `sub`. |
+| `tools.ts` | `transfer`: looks the operation up by `_meta["lab.stepup/operation_id"]` (in-band retry) or by `(session, request id)` (HTTP replay). On first run it validates (read-only), creates `op_X`, **elicits** confirmation, then requires the `money_transfer` details for exactly this operation. On replay it resumes from the checkpoint, re-validates, commits and burns the token. `naive_batch_transfer` (demo): with a new payee it registers the payee first (a commit), so the guard returns a partial result. With known payees it challenges once with **N `authorization_details`**, so one consent covers the batch. |
+| `challenge.ts` | The **transport-independent** form of the challenge: JSON-RPC error **`AUTHORIZATION_REQUIRED` (-32043)** with `data = {error, error_description, authorization_remediation, resource_metadata, operation_id}`. `bindInband(transport)` wraps any connected transport so a recorded challenge replaces the tool's discarded result with that error. It also defines the lab `_meta` keys: `lab.stepup/operation_id` (resume a pending operation) and `lab.stepup/access_token` (one-shot token, stdio only). |
+| `index.ts` | JSON response mode. With `CHALLENGE_BINDING=http` (default) it rewrites a recorded challenge into the 401. The 401/403 body is **RFC 9457 problem details, not a JSON-RPC response**: a transport challenge leaves the request unanswered, so replaying the same id is legitimate. With `CHALLENGE_BINDING=inband` it applies `bindInband` instead. A one-shot token is accepted only for a payment `tools/call`; anything else gets `403 insufficient_scope`. Sessions are bound to `sub`. |
+| `stdio.ts` | The same server over **stdio**. The session token comes from `MCP_ACCESS_TOKEN`, challenges are always in-band, and the one-shot token arrives in `_meta`. |
+| `stdio-probe.ts` | A headless stdio walkthrough: `-32043` → one-shot token → retry with `_meta` → stored result on duplicate → one-shot token refused for a non-payment tool. |
 
 ## Step 3: the agent (`agent/src`)
 
 | File | What it does |
 |---|---|
-| `stepup-fetch.ts` | The client half. **401 / 403 insufficient_scope** → (re)obtain the **session** token, replay, keep using it. **401 insufficient_authorization** → decode `authorization_remediation`, obtain a **one-shot** token, replay **this one request** with it, discard it. If the replay fails again, that's non-remediable and the client stops (draft §7.1 step 4, §7.3.3). |
+| `stepup-fetch.ts` | The client half. **401 / 403 insufficient_scope** → (re)obtain the **session** token, replay, keep using it. **401 insufficient_authorization** → decode `authorization_remediation`, obtain a **one-shot** token, replay **this one request** with it, discard it. If the replay fails again, that's non-remediable and the client stops (draft §7.1 step 4, §7.3.3). If the user **declines** (or remediation is impossible), the `tools/call` is answered locally with a `CallToolResult` with **`isError: true`** ("the user declined… do not retry"), not a transport error, so the model sees a tool outcome and doesn't loop. |
+| `inband.ts` | `callToolWithAuthorization()`: on JSON-RPC error **-32043** it runs the same one-shot authorization, then **retries as a new `tools/call`** with `_meta["lab.stepup/operation_id"]`. The server resumes the checkpoint, with no second elicitation. The one-shot token is attached to exactly that request (`oauth.armOneShot`). A denial again becomes an `isError` result. |
 | `oauth.ts` | Discovery (PRM → AS metadata, issuer check, `authorization_details_types_supported` check). The code flow + PKCE + `resource` is shared by the session grant (`scope=…`) and the operation grant (`authorization_details=…`, **no scope**). The session token is never overwritten by an operation token. |
 | `elicitation.ts` | Form elicitation in the terminal (`Y/n/c`). |
 | `index.ts` | Claude tool-use loop. Declares the elicitation capability, with a 5 min timeout for held requests. |
@@ -97,6 +101,17 @@ docker compose ps                # idp and mcp-server "healthy"
 
 bash scripts/probe.sh            # raw-HTTP proof, no LLM
 docker compose run --build --rm --service-ports agent
+```
+
+**Variants:**
+
+```bash
+# Same flow with the in-band binding over HTTP (JSON-RPC error -32043 instead of 401):
+CHALLENGE_BINDING=inband docker compose up -d --build mcp-server
+docker compose run --build --rm --service-ports agent
+
+# The same server over stdio (in-band is the only option there):
+docker compose run --rm mcp-server node src/stdio-probe.ts
 ```
 
 `probe.sh` shows:
@@ -132,6 +147,20 @@ Logs: `docker compose logs -f idp mcp-server` shows `[consent]`, `[token]` (scop
 7. **Batch.** One remediation can carry N `authorization_details`, so one consent and one token cover N transfers.
 8. **Elicitation versus HTTP challenges.** In JSON response mode, the elicitation has to travel unrelated on the standalone GET stream, because the SDK drops request-related server messages there. Elicitation remains UX only; authorization comes from the AS.
 9. **Timeouts.** A held request waits on a human, so the SDK's 60 s default is too short.
+
+## Tool semantics: what the lab does about them
+
+The challenge is modeled as one abstract outcome: **"authorization required for these `authorization_details`; nothing was executed"**. Each transport carries it in its own way:
+
+| | HTTP binding (`401`) | In-band binding (`-32043`) |
+|---|---|---|
+| Was the JSON-RPC request answered? | **No.** The body is problem details, not a JSON-RPC response | **Yes**, with a JSON-RPC error |
+| How the client continues | Replays the **same** request (same id, same session) | Sends a **new** `tools/call` with `_meta["lab.stepup/operation_id"]` |
+| How the server resumes | Pending operation keyed by `(session, request id)` | Pending operation looked up by operation id |
+| Where the one-shot token goes | `Authorization` header | `Authorization` header (HTTP) or `_meta["lab.stepup/access_token"]` (stdio) |
+| Transports | Streamable HTTP only | Any (HTTP, stdio) |
+
+In both bindings a **user refusal is a tool result** (`isError: true`), and the guard keeps the "nothing was executed" promise. The `-32043` code and the `_meta` keys are lab-defined, modeled on the spec's `-32042` (URL elicitation required). Standardizing them is part of the proposal.
 
 ## Troubleshooting
 

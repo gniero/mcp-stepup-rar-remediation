@@ -2,7 +2,8 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { config } from "./config.ts";
 import { ChallengeAfterCommit, commit, consumeToken, requireAuthorizationDetails } from "./stepup.ts";
-import { createOperation, findByRequest, hashArgs, requestKey, setStatus, type Operation } from "./operations.ts";
+import { createOperation, findById, findByRequest, hashArgs, requestKey, setStatus, type Operation } from "./operations.ts";
+import { META_OPERATION_ID } from "./challenge.ts";
 import type { AuthorizationDetail, Principal } from "./auth.ts";
 
 type Account = { id: string; name: string; balance: number };
@@ -71,10 +72,14 @@ export function buildServer(): McpServer {
       const l = ledgerFor(p.sub);
       const key = requestKey(extra.sessionId, extra.requestId);
       const argsHash = hashArgs(args);
-      let op = findByRequest(key) as Operation<Checkpoint> | undefined;
+      // HTTP binding: the replay reuses (session, request id). In-band binding: the retry is a new
+      // request that names the pending operation in _meta.
+      const handle = (extra._meta as Record<string, unknown> | undefined)?.[META_OPERATION_ID] as string | undefined;
+      let op = (handle ? findById(handle) : findByRequest(key)) as Operation<Checkpoint> | undefined;
+      if (handle && !op) return fail(`Unknown or expired operation ${handle}; nothing was executed.`);
 
       if (op) {
-        // ---- Replay of a request we have already seen -------------------------
+        // ---- Retry of an operation we have already seen ------------------------
         if (op.sub !== p.sub || op.argsHash !== argsHash) return fail("Replay does not match the pending operation.");
         if (op.status === "completed") {
           console.log(`[op] ${op.id} duplicate replay -> returning stored result (no re-execution)`);
@@ -157,31 +162,53 @@ export function buildServer(): McpServer {
       async ({ from_account, items }, extra) => {
         const p = extra.authInfo as Principal;
         const l = ledgerFor(p.sub);
+        const key = requestKey(extra.sessionId, extra.requestId);
+        const argsHash = hashArgs({ from_account, items });
+        const handle = (extra._meta as Record<string, unknown> | undefined)?.[META_OPERATION_ID] as string | undefined;
+        let op = (handle ? findById(handle) : findByRequest(key)) as Operation<BatchCheckpoint> | undefined;
+        if (handle && !op) return fail(`Unknown or expired operation ${handle}; nothing was executed.`);
+        if (op && (op.sub !== p.sub || op.argsHash !== argsHash)) return fail("Retry does not match the pending operation.");
+        if (op?.status === "completed") return op.result!;
+
         const registered: string[] = [];
-        for (const it of items) {
-          if (!l.payees.has(it.pix_key)) {
-            commit(`register payee ${it.pix_key}`, () => l.payees.add(it.pix_key));
-            registered.push(it.pix_key);
+        if (!op) {
+          for (const it of items) {
+            if (!l.payees.has(it.pix_key)) {
+              commit(`register payee ${it.pix_key}`, () => l.payees.add(it.pix_key));
+              registered.push(it.pix_key);
+            }
           }
+          op = createOperation<BatchCheckpoint>({
+            sub: p.sub,
+            requestKey: key,
+            tool: "naive_batch_transfer",
+            argsHash,
+            summary: `batch of ${items.length} transfers from ${from_account}`,
+            // One remediation can carry several authorization_details: one consent covers the whole batch.
+            checkpoint: { details: items.map((it) => moneyTransferDetail(from_account, it.pix_key, it.amount)) },
+          });
+          setStatus(op, "awaiting_authorization");
         }
-        // One remediation can carry several authorization_details: one consent covers the whole batch.
-        const details = items.map((it) => moneyTransferDetail(from_account, it.pix_key, it.amount));
         try {
-          requireAuthorizationDetails(extra, details, `batch of ${items.length} transfers`);
+          requireAuthorizationDetails(extra, op.checkpoint.details, `batch of ${items.length} transfers`, op.id);
         } catch (e) {
-          if (!(e instanceof ChallengeAfterCommit)) throw e; // nothing committed yet -> 401 is honest
-          return fail(
+          if (!(e instanceof ChallengeAfterCommit)) throw e; // nothing committed yet -> the challenge is honest
+          const result = fail(
             `Partially executed. Registered new payees: ${registered.join(", ")}.\n` +
               `No transfer was executed: the transfers need authorization, which cannot be requested after ` +
               `this call already changed state. Submit the transfers again (payees are now registered).`,
           );
+          setStatus(op, "failed", result);
+          return result;
         }
         const acct = l.accounts.find((a) => a.id === from_account);
         const total = items.reduce((s, it) => s + it.amount, 0);
         if (!acct || acct.balance < total) return fail("Unknown account or insufficient funds; nothing executed.");
         const done = items.map((it) => commit(`batch ${it.pix_key}`, () => doTransfer(l, { from_account, ...it })));
         consumeToken(extra);
-        return text(`Batch done:\n${done.map((r) => r.content[0].text.split("\n")[0]).join("\n")}`);
+        const result = text(`Batch done (operation ${op.id}):\n${done.map((r) => r.content[0].text.split("\n")[0]).join("\n")}`);
+        setStatus(op, "completed", result);
+        return result;
       },
     );
   }
@@ -190,6 +217,7 @@ export function buildServer(): McpServer {
 }
 
 type Checkpoint = { detail: AuthorizationDetail; notes: string[] };
+type BatchCheckpoint = { details: AuthorizationDetail[] };
 
 /** The RFC 9396 authorization details object that authorizes exactly one transfer. */
 function moneyTransferDetail(from: string, pixKey: string, amount: number): AuthorizationDetail {

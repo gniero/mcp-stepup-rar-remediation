@@ -19,6 +19,13 @@ export const config = {
   elicitationTimeoutMs: Number(env("ELICITATION_TIMEOUT_MS", "120000")),
   /** Registers `naive_batch_transfer`, a deliberately badly-ordered tool that trips the commit guard (with new payees). */
   demoUnsafeTool: env("DEMO_UNSAFE_TOOL", "true") === "true",
+  /**
+   * How a mid-tool authorization challenge is carried over Streamable HTTP:
+   *  - "http":   401 + WWW-Authenticate insufficient_authorization (RAR remediation draft). Default.
+   *  - "inband": JSON-RPC error AUTHORIZATION_REQUIRED (-32043) with the same remediation data,
+   *              i.e. the transport-independent form (the only one available over stdio).
+   */
+  challengeBinding: env("CHALLENGE_BINDING", "http") as "http" | "inband",
   /** Informational only (shown to the user): transfers above this amount are flagged as high value. */
   riskAmountThreshold: Number(env("RISK_AMOUNT_THRESHOLD", "500")),
 };

@@ -7,14 +7,31 @@ import { config, prmPath } from "./config.ts";
 import { AuthError, authenticate, bearerChallenge, insufficientAuthorizationChallenge, protectedResourceMetadata } from "./auth.ts";
 import { newRequestContext, requestContext } from "./stepup.ts";
 import { buildServer } from "./tools.ts";
-
-const PAYMENT_TOOLS = new Set(["transfer", "naive_batch_transfer"]);
+import { PAYMENT_TOOLS, bindInband } from "./challenge.ts";
 
 type Session = { transport: WebStandardStreamableHTTPServerTransport; sub: string };
 const sessions = new Map<string, Session>();
 
 const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
   new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+
+/**
+ * RFC 9457 problem details for HTTP-level auth failures. Deliberately NOT a JSON-RPC response:
+ * a transport challenge means the JSON-RPC request has not been answered, so the client may
+ * replay the same request (same id) once it holds an acceptable token.
+ */
+const problem = (status: 401 | 403, title: string, detail: string, extra: Record<string, unknown> = {}, headers: Record<string, string> = {}) =>
+  new Response(
+    JSON.stringify({
+      type: "about:blank",
+      title,
+      status,
+      detail,
+      ...extra,
+      note: "Transport-level challenge: no JSON-RPC response was produced for this request. Replay the same request with an acceptable token.",
+    }),
+    { status, headers: { "content-type": "application/problem+json", ...headers } },
+  );
 
 const rpcError = (id: unknown, code: number, message: string, data?: unknown) => ({
   jsonrpc: "2.0",
@@ -35,7 +52,9 @@ async function handleMcp(req: Request): Promise<Response> {
   } catch (e) {
     if (e instanceof AuthError) {
       console.log(`[http] ${req.method} /mcp -> ${e.status} (${e.message})`);
-      return json(e.status, { error: e.message }, { "www-authenticate": e.wwwAuthenticate });
+      return problem(e.status, e.status === 401 ? "unauthorized" : "insufficient_scope", e.message, {}, {
+        "www-authenticate": e.wwwAuthenticate,
+      });
     }
     throw e;
   }
@@ -53,19 +72,16 @@ async function handleMcp(req: Request): Promise<Response> {
       req.method === "POST" && (body as any)?.method === "tools/call" && PAYMENT_TOOLS.has((body as any)?.params?.name);
     if (!isPaymentCall) {
       console.log(`[http] ${req.method} /mcp ${describe(body)} -> 403 (one-shot token used outside a payment call)`);
-      return json(403, rpcError((body as any)?.id, -32003, "insufficient_scope"), {
-        "www-authenticate": bearerChallenge({
-          error: "insufficient_scope",
-          scope: [config.baseScope],
-          description: "one-shot operation token can only be used for the operation it authorizes",
-        }),
+      const description = "one-shot operation token can only be used for the operation it authorizes";
+      return problem(403, "insufficient_scope", description, {}, {
+        "www-authenticate": bearerChallenge({ error: "insufficient_scope", scope: [config.baseScope], description }),
       });
     }
   }
 
   // A stepped-up token must belong to the same user that opened the session.
   if (session && session.sub !== principal.sub) {
-    return json(401, rpcError(null, -32001, "token subject does not match session"), {
+    return problem(401, "invalid_token", "token subject does not match session", {}, {
       "www-authenticate": bearerChallenge({ error: "invalid_token", description: "subject mismatch for session" }),
     });
   }
@@ -90,6 +106,8 @@ async function handleMcp(req: Request): Promise<Response> {
       if (transport.sessionId) sessions.delete(transport.sessionId);
     };
     await buildServer().connect(transport);
+    // In-band binding: challenges become AUTHORIZATION_REQUIRED JSON-RPC errors inside a 200.
+    if (config.challengeBinding === "inband") bindInband(transport);
     session = { transport, sub };
   }
 
@@ -107,14 +125,16 @@ async function handleMcp(req: Request): Promise<Response> {
       `Additional authorization is required: ${ctx.challenge.reason}`,
     );
     console.log(`[http] POST /mcp ${describe(body)} -> 401 insufficient_authorization (${ctx.challenge.reason})`);
-    return json(
+    return problem(
       401,
-      // Non-normative body: the draft carries the remediation in the header only. The JSON-RPC
-      // error keeps the request id so clients that don't remediate still get a well-formed error.
-      rpcError((body as any)?.id, -32001, "insufficient_authorization", {
+      "insufficient_authorization",
+      `Additional authorization is required: ${ctx.challenge.reason}`,
+      // Non-normative convenience copy; the normative carrier is the WWW-Authenticate header.
+      {
+        type: "https://datatracker.ietf.org/doc/draft-ietf-oauth-rar-metadata-remediation/",
         authorization_remediation: remediation,
         operation_id: ctx.challenge.operationId,
-      }),
+      },
       { "www-authenticate": header },
     );
   }
@@ -137,5 +157,7 @@ createServer((req, res) => {
   if (path === mcpPath) return void mcpListener(req, res);
   res.writeHead(404).end();
 }).listen(config.port, () => {
-  console.log(`MCP server on :${config.port}${mcpPath}  resource=${config.resource}  issuer=${config.issuer}`);
+  console.log(
+    `MCP server on :${config.port}${mcpPath}  resource=${config.resource}  issuer=${config.issuer}  challenge binding=${config.challengeBinding}`,
+  );
 });

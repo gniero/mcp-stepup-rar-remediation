@@ -56,7 +56,8 @@ hdr "7. identical transfer as a NEW request with the same (now consumed) one-sho
 post "$OP" '{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"transfer","arguments":{"from_account":"checking","pix_key":"carol@pix.example","amount":800}}}' "$SID"
 
 hdr "8. naive batch with a NEW payee: registers it (commit), then needs authorization -> guard, partial result in-band"
-post "$BASE" '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"naive_batch_transfer","arguments":{"from_account":"checking","items":[{"pix_key":"zed@pix.example","amount":20}]}}}' "$SID"
+NEWKEY="zed-$RANDOM@pix.example"
+post "$BASE" '{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"naive_batch_transfer","arguments":{"from_account":"checking","items":[{"pix_key":"'"$NEWKEY"'","amount":20}]}}}' "$SID"
 
 hdr "9. balances with the session token (still valid, never replaced)"
 post "$BASE" '{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"get_accounts","arguments":{}}}' "$SID"

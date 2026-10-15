@@ -1,8 +1,9 @@
 /**
- * Pending-operation store: the server-side checkpoint that makes "403 + replay" safe.
+ * Pending-operation store: the server-side checkpoint that makes "challenge + retry" safe.
  *
- * - Keyed by (MCP session, JSON-RPC request id), which the client reuses on replay,
- *   so the replay resumes the operation instead of starting it over.
+ * - Keyed by (MCP session, JSON-RPC request id), which the client reuses on an HTTP-level replay,
+ *   and by operation id, which the client sends back in `_meta` on an in-band retry. Either way the
+ *   retry resumes the operation instead of starting it over.
  * - The operation's authorization_details (RFC 9396) are what the one-shot token must carry.
  * - Completed operations keep their result, so a duplicate replay returns the stored
  *   result instead of executing twice (idempotency).
@@ -42,6 +43,11 @@ export function hashArgs(args: unknown): string {
 
 export function findByRequest(key: string): Operation | undefined {
   const id = byRequest.get(key);
+  return findById(id);
+}
+
+/** Explicit operation handle (in-band retries arrive as a NEW JSON-RPC request carrying it in _meta). */
+export function findById(id: string | undefined): Operation | undefined {
   const op = id ? byId.get(id) : undefined;
   if (op && op.expiresAt < Date.now() && op.status !== "completed") {
     op.status = "failed";

@@ -93,6 +93,21 @@ export class OAuthSession {
     this.callbackPort = callbackPort;
   }
 
+  /** One-shot token waiting for the in-band retry of a specific operation. */
+  private armed?: { token: string; operationId: string };
+
+  armOneShot(token: string, operationId: string) {
+    this.armed = { token, operationId };
+  }
+
+  /** Hand out the armed token once, only to the request that names its operation. */
+  takeArmedOneShot(operationId: string | undefined): string | undefined {
+    if (!this.armed || !operationId || this.armed.operationId !== operationId) return undefined;
+    const t = this.armed.token;
+    this.armed = undefined;
+    return t;
+  }
+
   /** The session token (baseline scope). Never replaced by a one-shot token. */
   get token() {
     return this.accessToken;

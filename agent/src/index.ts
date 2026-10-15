@@ -13,6 +13,7 @@ import { OAuthSession } from "./oauth.ts";
 import { stepUpFetch } from "./stepup-fetch.ts";
 import { log } from "./log.ts";
 import { registerElicitation } from "./elicitation.ts";
+import { callToolWithAuthorization } from "./inband.ts";
 
 const MCP_URL = process.env.MCP_URL ?? "http://mcp-server:3000/mcp";
 const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
@@ -49,7 +50,8 @@ const llmTools: Anthropic.Tool[] = tools.map((t) => ({
 }));
 const system =
   "You are a banking assistant for a Brazilian user. Use the tools to act. " +
-  "Amounts are in BRL. Be brief. If a tool fails, explain the failure to the user.";
+  "Amounts are in BRL. Be brief. If a tool fails, explain the failure to the user. " +
+  "If the user declined an authorization, do not retry that operation unless they ask again.";
 const messages: Anthropic.MessageParam[] = [];
 
 async function turn(userText: string) {
@@ -65,16 +67,18 @@ async function turn(userText: string) {
       if (b.type !== "tool_use") continue;
       log.tool(`${b.name} ${JSON.stringify(b.input)}`);
       try {
-        const r = await mcp.callTool(
+        // HTTP binding (401) is handled inside stepUpFetch; in-band binding (-32043) here.
+        const r = await callToolWithAuthorization(
+          mcp,
+          oauth,
           { name: b.name, arguments: b.input as Record<string, unknown> },
-          undefined,
           { timeout: HELD_REQUEST_TIMEOUT_MS },
         );
         const out = (r.content as any[]).map((c) => (c.type === "text" ? c.text : JSON.stringify(c))).join("\n");
         log.tool(`result${r.isError ? " (error)" : ""}: ${out.split("\n")[0]}`);
         results.push({ type: "tool_result", tool_use_id: b.id, content: out, is_error: Boolean(r.isError) });
       } catch (e) {
-        // e.g. the user refused the step-up: the original 403 surfaces here.
+        // Transport/protocol failures only: a refused authorization arrives as an isError result.
         const msg = (e as Error).message;
         log.tool(`call failed: ${msg}`);
         results.push({ type: "tool_result", tool_use_id: b.id, content: `Tool call failed: ${msg}`, is_error: true });
