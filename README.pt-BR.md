@@ -160,19 +160,19 @@ No Mac, rode o modelo **nativamente, não no Docker**. O Docker Desktop não usa
 
 ```bash
 # 1. no Mac (app do Ollama ou `brew install ollama`)
-ollama pull qwen3:8b            # modelo com tool calling; ~5 GB, roda bem com 16 GB de RAM
+ollama pull llama3.2:1b            # modelo com tool calling; ~5 GB, roda bem com 16 GB de RAM
 ollama serve                    # dispensável se o app do Ollama estiver na barra de menus
 
 # 2. no .env
 LLM_PROVIDER=openai
-LLM_MODEL=qwen3:8b
+LLM_MODEL=llama3.2:1b
 # OPENAI_BASE_URL=http://host.docker.internal:1234/v1   # para LM Studio em vez de Ollama
 
 # 3. rode como de costume (sem chave da Anthropic)
 docker compose run --build --rm --service-ports agent
 ```
 
-O log de inicialização mostra `LLM: openai-compatible / qwen3:8b @ http://host.docker.internal:11434/v1`.
+O log de inicialização mostra `LLM: openai-compatible / llama3.2:1b @ http://host.docker.internal:11434/v1`.
 
 O que o driver faz para ajudar modelos pequenos:
 

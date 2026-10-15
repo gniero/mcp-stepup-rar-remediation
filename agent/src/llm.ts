@@ -24,7 +24,7 @@ export const SYSTEM_PROMPT =
 const MAX_STEPS = Number(process.env.LLM_MAX_STEPS ?? "8");
 
 const say = (text: string) => {
-  const clean = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim(); // reasoning models (e.g. Qwen 3)
+  const clean = text.replace(/<think>[\s\S]*?<\/think>/g, "").trim(); // reasoning models (e.g. Llama 3.2)
   if (clean) console.log(`\nassistant> ${clean}\n`);
 };
 
@@ -80,7 +80,7 @@ type OAIToolCall = { id: string; type: "function"; function: { name: string; arg
 
 function openAiCompatibleChat(tools: Tool[], callTool: CallTool): Chat {
   const baseUrl = (process.env.OPENAI_BASE_URL ?? "http://host.docker.internal:11434/v1").replace(/\/$/, "");
-  const model = process.env.LLM_MODEL || "qwen3:8b";
+  const model = process.env.LLM_MODEL || "llama3.2:1b";
   const apiKey = process.env.OPENAI_API_KEY ?? "local"; // Ollama / LM Studio ignore it
   const temperature = Number(process.env.LLM_TEMPERATURE ?? "0.2");
   const byName = new Map(tools.map((t) => [t.name, t]));
