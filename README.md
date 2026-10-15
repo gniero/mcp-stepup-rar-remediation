@@ -1,19 +1,21 @@
-# MCP step-up lab: `WWW-Authenticate` mid-interaction
+# MCP step-up lab: per-operation authorization with RAR remediation
 
-A docker compose workspace to validate this proposal: **an MCP tool finds out _while running_ that the caller's grant is not enough and answers with an HTTP `403` + `WWW-Authenticate: Bearer error="insufficient_scope"`. The client holds the in-flight request, gets a stepped-up token, and replays the same request. The tool doesn't advertise the requirement up front, and elicitation is never the authorization mechanism.**
+> Versão em português (Brasil): [README.pt-BR.md](README.pt-BR.md)
 
-The lab also makes the replay **safe**:
+A docker compose workspace to validate this proposal. **An MCP tool finds out _while running_ that the operation needs its own authorization, and answers with `401` + `WWW-Authenticate: Bearer error="insufficient_authorization", authorization_remediation=…`, as defined in [draft-ietf-oauth-rar-metadata-remediation](https://datatracker.ietf.org/doc/draft-ietf-oauth-rar-metadata-remediation/). The client holds the in-flight request, obtains a one-shot token carrying exactly the remediation's RFC 9396 `authorization_details`, and replays the same request.** The tool doesn't advertise the requirement up front, and elicitation is never the authorization mechanism.
 
-* **Atomic 403.** A challenge means nothing was executed. A commit guard enforces it.
-* **Pending operations.** The server checkpoints the operation, so the replay resumes it instead of starting over, and a duplicate replay returns the stored result.
-* **Operation-bound step-up.** The new token carries `payment-op:<operation-id>`, so it authorizes that payment only.
-* **Pre-step-up elicitation.** Before the browser redirect, the user sees what is pending and confirms they want to continue.
+* **Every transfer needs a `money_transfer` grant** whose `authorization_details` pin the debtor account, the creditor (Pix key) and the amount.
+* **One-shot tokens.** The operation token carries **no scope** (no previous permission is re-requested), lives 2 minutes, and is burned by the MCP server (by `jti`) when the operation commits. The agent uses it for that single replay and discards it.
+* **The session token is kept.** The `mcp:basic` token from login keeps serving balances and every other call. It is never replaced.
+* **Atomic challenge.** A 401 means nothing was executed, and a commit guard enforces that.
+* **Pending operations.** The replay resumes from a checkpoint, and a duplicate replay returns the stored result.
+* **Pre-authorization elicitation.** The user sees what is pending and confirms before the browser redirect.
 
 | Component | Path | Role |
 |---|---|---|
-| **IdP / AS** | `idp/` | Keycloak 26.8, realm `mcp`, scope `mcp:basic` (baseline), parameterized scope `payment-op:<id>` (per-operation step-up) |
-| **MCP server** | `mcp-server/` | Streamable HTTP resource server (TS SDK 1.32), toy Pix bank, RFC 9728 metadata, pending-operation store |
-| **Agent** | `agent/` | Claude tool-use loop over an MCP client that answers form elicitation and transparently handles Bearer challenges |
+| **IdP / AS** | `idp/` | [node-oidc-provider](https://github.com/panva/node-oidc-provider) 9.12 with RAR, the `money_transfer` type, a consent page that renders the payment, and the `authorization_details_types_metadata_endpoint` |
+| **MCP server** | `mcp-server/` | Streamable HTTP resource server (TS SDK 1.32), toy Pix bank, RFC 9728 metadata, pending-operation store, RAR remediation |
+| **Agent** | `agent/` | Claude tool-use loop over an MCP client that answers form elicitation and handles Bearer challenges (session and one-shot) |
 
 ```mermaid
 sequenceDiagram
@@ -21,32 +23,34 @@ sequenceDiagram
     participant U as User
     participant A as Agent (LLM + MCP client)
     participant M as MCP server
-    participant K as Keycloak
+    participant K as AS (oidc-provider)
     A->>M: POST initialize (no token)
     M-->>A: 401 WWW-Authenticate: Bearer resource_metadata="…", scope="mcp:basic"
     A->>U: browser: login + consent (mcp:basic)
-    A->>M: replay initialize → 200, session S (+ GET SSE stream)
-    Note over A,M: … low-risk tool calls succeed on the baseline token …
-    A->>M: POST tools/call transfer(R$ 800, new key)  [id=7, session S]
-    M->>M: validate + risk (read-only) → needs more → create op_X (checkpoint)
+    K-->>A: SESSION token T1 (scope=mcp:basic)
+    A->>M: replay initialize (T1) → 200, session S (+ GET SSE stream)
+    A->>M: tools/call get_accounts (T1) → 200
+    A->>M: POST tools/call transfer(R$ 800 → carol)  [id=7, S, T1]
+    M->>M: validate (read-only) → create op_X (checkpoint)
     M-->>A: elicitation/create on GET stream: "Pending payment op_X … continue?"
-    A->>U: terminal prompt
     U-->>A: yes
-    A-->>M: elicitation result {proceed:true}
-    M-->>A: 403 WWW-Authenticate: Bearer error="insufficient_scope", scope="mcp:basic payment-op:op_X"
-    A->>U: browser: /authorize?scope=…payment-op:op_X&prompt=consent
-    U->>K: approve "this specific payment"
-    K-->>A: token (scope=mcp:basic payment-op:op_X)
-    A->>M: replay SAME request [id=7, session S]
-    M->>M: find op_X by (S, 7) → resume from checkpoint → re-validate → commit
-    M-->>A: 200 result → LLM sees only this
+    M-->>A: 401 Bearer error="insufficient_authorization", authorization_remediation=b64url({authorization_details:[money_transfer…]})
+    A->>U: browser: /authorize?authorization_details=[…]&resource=…  (NO scope)
+    U->>K: approve "R$ 800.00 · checking → carol@pix.example"
+    K-->>A: ONE-SHOT token T2 (authorization_details only, 120 s)
+    A->>M: replay SAME request [id=7, S] with T2
+    M->>M: op_X resumed → details match → commit → burn T2 (jti)
+    M-->>A: 200 result
+    A->>M: tools/call get_accounts (T1 again) → 200
 ```
+
+A detailed PlantUML version is in `docs/stepup-sequence.puml`.
 
 ---
 
 ## Step 0: prerequisites
 
-* Docker Desktop (Compose v2.24+, for `env_file.required`)
+* Docker Desktop (Compose v2.24+)
 * An Anthropic API key (for the agent only; the curl probe doesn't need it)
 * Ports 8080, 3000 and 8765 free on the host
 
@@ -54,83 +58,87 @@ sequenceDiagram
 cp .env.example .env     # put your ANTHROPIC_API_KEY in it
 ```
 
-## Step 1: the IdP (`idp/realm-mcp.json`)
+## Step 1: the AS (`idp/src`)
 
-Keycloak imports the realm at boot (`start-dev --import-realm`). What matters in it:
+| File | What it does |
+|---|---|
+| `money-transfer.js` | The `money_transfer` type: JSON Schema (served by the metadata endpoint), a validator and a display helper. Shape: `{type, debtor_account:{account_id}, creditor_account:{pix_key}, instructed_amount:{currency:"BRL", amount:"800.00"}}`. |
+| `index.js` | oidc-provider config. `resourceIndicators` issues **JWT** access tokens with `aud = http://mcp-server:3000/mcp`: 600 s for the session grant, 120 s for an operation grant. `richAuthorizationRequests` validates the type, and the code and token carry **only the current request's** `authorization_details`, so nothing accumulates from earlier grants. Discovery adds `authorization_details_types_metadata_endpoint` → `GET /authorization-details-types`. Custom login and consent pages render the payment (amount, debtor, creditor). A lab-only password grant serves the headless probe. |
 
-* **`mcp:basic`** is a default scope: baseline access to the MCP server.
-* **`payment-op`** is a **parameterized scope** (preview feature `parameterized-scopes`, enabled in compose), so clients request `payment-op:<operation-id>`. The token's `scope` carries the exact operation id, which binds the step-up to **one** pending operation instead of a broad "elevated" grant. Both scopes carry an **audience mapper** that adds `aud = http://mcp-server:3000/mcp`. Keycloak ignores RFC 8707 `resource`, so the mapper stands in for it.
-* **`mcp-agent` client.** Public, auth code + PKCE S256, redirect `http://localhost:8765/callback`, `consentRequired: true`. The agent sends `prompt=consent` on every step-up, so the user approves each operation even though Keycloak remembers consent for the `payment-op` scope family.
-* **`mcp-probe` client.** Lab-only password grant, so `scripts/probe.sh` can run headless.
-* **User:** `alice` / `alice`. **Admin console:** http://localhost:8080 (`admin` / `admin`).
-* **Hostname split.** `KC_HOSTNAME=http://localhost:8080` plus `KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true`. Tokens always say `iss=http://localhost:8080/realms/mcp`, while containers call token/JWKS on `http://keycloak:8080`. The agent maps front-channel to back-channel URLs with `BACKCHANNEL_REWRITE`.
+* **Clients:** `mcp-agent` (public, auth code + PKCE, `authorization_details_types: ["money_transfer"]`) and `mcp-probe` (lab-only password grant).
+* **User:** `alice` / `alice`.
+* **Hostname split:** the issuer is `http://localhost:8080` for the browser. Containers reach `http://idp:8080`, and the AS pins every URL it emits to the issuer. The agent rewrites back-channel calls with `BACKCHANNEL_REWRITE`.
 
 ## Step 2: the MCP server (`mcp-server/src`)
 
 | File | What it does |
 |---|---|
-| `auth.ts` | Validates JWTs (iss, aud, signature via JWKS) on **every** HTTP request and requires `mcp:basic`. With no token it returns `401` plus `resource_metadata`. Serves PRM, which on purpose advertises only `mcp:basic`. |
-| `stepup.ts` | `requireScopes()` records a challenge in an `AsyncLocalStorage` scoped to the HTTP request and aborts the tool. **`commit(label, fn)`** wraps every side effect. **Guard:** once something was committed in the request, `requireScopes()` refuses to produce a 403 and throws `StepUpAfterCommit` instead. The challenge scope is the client's current scopes, minus stale `payment-op:*`, plus what's needed. |
-| `operations.ts` | **Pending-operation store**, keyed by `(Mcp-Session-Id, JSON-RPC id)`, which the client reuses on replay. Holds the operation id, args hash, checkpoint (risk result), status (`awaiting_confirmation → awaiting_step_up → completed / cancelled / failed`), the stored result and a TTL. |
-| `tools.ts` | `transfer`: on first run it validates and evaluates risk (read-only). High risk creates `op_X` and then **elicits** confirmation. The user declining yields a normal tool result ("cancelled, nothing executed") with no 403. On proceed, `requireScopes(payment-op:op_X)`. On replay it finds `op_X`, checks that sub and args hash match, **resumes from the checkpoint** (no second risk call or elicitation), re-validates the balance and commits. If `op_X` is already completed, it returns the stored result (**idempotent**). `naive_batch_transfer` is a deliberately badly-ordered demo tool that commits item by item: the guard fires, and it reports partial progress **in-band**. |
-| `index.ts` | `WebStandardStreamableHTTPServerTransport` with **`enableJsonResponse: true`**. If a challenge was recorded, it replaces the JSON-RPC response with `403` + `WWW-Authenticate` and a JSON-RPC error body with the same `id` and `operation_id`. Each session is bound to the `sub` that opened it. |
+| `auth.ts` | Validates JWTs (iss, aud, signature) on every request. A token is either a **session token** (`mcp:basic`) or a **one-shot token** (only `authorization_details`). It also builds the remediation challenge: `401`, `error="insufficient_authorization"`, `error_description`, and `authorization_remediation=<base64url JSON>` with `authorization_details`. There's **no `authorization_reference`**, because the draft says to omit it for single-use tokens. `resource_metadata` is added so the client can find the AS. |
+| `stepup.ts` | `requireAuthorizationDetails(extra, detail(s))` passes only if the token carries equal details and its `jti` hasn't been consumed. Otherwise it records a challenge and aborts the tool. `commit()` wraps side effects; the **guard** refuses to challenge after a commit. `consumeToken()` burns the one-shot token once the operation commits. |
+| `operations.ts` | Pending-operation store keyed by `(Mcp-Session-Id, JSON-RPC id)`: checkpoint, status, stored result, TTL. |
+| `tools.ts` | `transfer`: validates (read-only), creates `op_X`, **elicits** confirmation, then requires the `money_transfer` details for exactly this operation. On replay it resumes from the checkpoint, re-validates, commits and burns the token. `naive_batch_transfer` (demo): with a new payee it registers the payee first (a commit), so the guard returns a partial result. With known payees it challenges once with **N `authorization_details`**, so one consent covers the batch. |
+| `index.ts` | JSON response mode. Rewrites a recorded challenge into the 401. A one-shot token is accepted only for a payment `tools/call`; anything else gets `403 insufficient_scope`. Sessions are bound to `sub`. |
 
 ## Step 3: the agent (`agent/src`)
 
 | File | What it does |
 |---|---|
-| `stepup-fetch.ts` | **The client half of the proposal.** A `fetch` passed to `StreamableHTTPClientTransport`. On `401`, or on `403` with `insufficient_scope`, it runs OAuth and **replays the identical HTTP request** (same JSON-RPC id, same session). Loop guards are in place. If the user denies, the original `403` goes up to the MCP layer. |
-| `oauth.ts` | Challenge → PRM → OIDC discovery (checks the issuer) → auth code + PKCE with `resource` → token. On a 403 it uses the **server's challenge scope as-is** (it's authoritative and already drops stale op scopes) and adds `prompt=consent`. Single-flight. One callback listener keyed by `state`. |
-| `elicitation.ts` | Form-mode elicitation handler: prints the server's message and asks in the terminal (`Y/n/c`). |
-| `index.ts` | Claude tool-use loop. Declares the `elicitation: { form: {} }` capability. MCP requests use a **5 min timeout**, because a held request waits on a human. |
+| `stepup-fetch.ts` | The client half. **401 / 403 insufficient_scope** → (re)obtain the **session** token, replay, keep using it. **401 insufficient_authorization** → decode `authorization_remediation`, obtain a **one-shot** token, replay **this one request** with it, discard it. If the replay fails again, that's non-remediable and the client stops (draft §7.1 step 4, §7.3.3). |
+| `oauth.ts` | Discovery (PRM → AS metadata, issuer check, `authorization_details_types_supported` check). The code flow + PKCE + `resource` is shared by the session grant (`scope=…`) and the operation grant (`authorization_details=…`, **no scope**). The session token is never overwritten by an operation token. |
+| `elicitation.ts` | Form elicitation in the terminal (`Y/n/c`). |
+| `index.ts` | Claude tool-use loop. Declares the elicitation capability, with a 5 min timeout for held requests. |
 
 ## Step 4: run it
 
 ```bash
-docker compose up -d --build          # keycloak + mcp-server (agent is behind a profile)
-docker compose ps                     # wait for both to be healthy
+docker compose down              # if the previous (Keycloak) version is still running
+docker compose up -d --build
+docker compose ps                # idp and mcp-server "healthy"
 
-bash scripts/probe.sh                 # raw-HTTP proof, no LLM (see below)
-
-docker compose run --rm --service-ports agent
+bash scripts/probe.sh            # raw-HTTP proof, no LLM
+docker compose run --build --rm --service-ports agent
 ```
 
-`probe.sh` declares no elicitation capability, so the server skips the confirmation step. It shows:
+`probe.sh` shows:
 
-* 401 with no token, then a low-risk call returning 200.
-* A high-risk call: 403 with `scope="mcp:basic payment-op:op_…"`, then the replay with an op-bound token returning 200.
-* The **same replay again**, which returns the stored result with no second debit.
-* A **different** high-risk call, which gets a new 403 because the op-bound token doesn't cover it.
-* `naive_batch_transfer`, where the guard turns the would-be 403 into a partial-progress result.
+1. 401 with no token.
+2. With the session token, a transfer gets **401 `insufficient_authorization`**. The script decodes the remediation and gets a one-shot token with just those details.
+3. The one-shot token used for `get_accounts` gets **403**.
+4. The replay returns **200**.
+5. Replaying again returns the stored result, with no double debit.
+6. The same transfer as a **new** request with the consumed token gets **401** again.
+7. The naive batch triggers the guard.
+8. Balances still work with the session token.
 
 In the agent REPL:
 
-1. Log in at the printed URL (`alice` / `alice`) and consent to "read your accounts".
-2. `send R$ 50 to bob@pix.example from checking`: low risk, executed directly.
-3. `send R$ 800 to carol@pix.example from checking`: the terminal shows **`[elicitation] Pending payment op_… continue?`**. Answer `n`: Claude reports that it was cancelled and nothing happened.
-4. Ask again and answer `y`. You get a browser link for **this payment**: approve it and the same call completes. The server log shows `resumed from checkpoint`.
-5. Ask again, answer `y`, and click **No** at Keycloak. The tool call fails cleanly and the balance is unchanged.
-6. `do a naive batch from checking: R$ 20 to bob@pix.example and R$ 900 to zed@pix.example`: you get a partial-execution report from the guard.
+1. Log in (`alice` / `alice`) and **Allow** "Read your accounts and balances".
+2. `what are my balances?`: uses the session token.
+3. `send R$ 800 to carol@pix.example from checking`: answer **y** to the elicitation. The browser shows **"Approve this payment: R$ 800.00, checking → carol@pix.example"**. Approve it and the transfer completes. The agent log shows `one-shot token issued, scope=""`.
+4. `what are my balances now?`: no login and no consent. The session token is reused.
+5. `send R$ 50 to bob@pix.example from checking`: even a small payment to a known payee needs its own approval.
+6. Try **n** at the elicitation (nothing happens) or **Deny** in the browser (the call fails, the balance is unchanged).
 
-Logs: `docker compose logs -f mcp-server` shows `[op]` lifecycle lines, `[guard]`, risk decisions and the 403 rewrite.
+Logs: `docker compose logs -f idp mcp-server` shows `[consent]`, `[token]` (scope and authorization_details per token), `[op]`, `[auth] one-shot token … consumed` and `[guard]`.
 
 ## What this lab surfaced (input for the proposal)
 
-1. **Atomic-403 rule (normative candidate).** A server MUST NOT send `insufficient_scope` for a request after committing side effects for it. This matches HTTP semantics (4xx = not processed) and is what makes client replay safe. Non-atomic work must report partial progress in-band (guard demo) or be split into prepare and commit steps.
-2. **Replay identity = operation identity.** `(session, JSON-RPC id)` lets the server resume a checkpointed operation and dedupe replays. A spec should either bless this or add an explicit operation handle to the challenge (`operation_id` auth-param). The request id alone is weak across reconnects.
-3. **Operation-bound authorization.** A broad elevated scope lets later high-risk calls pass silently until the token expires. Binding the challenge to `payment-op:<id>` fixes that. The AS still only shows a generic consent text, though: it doesn't know the payment details. **RAR (RFC 9396) `authorization_details`** in the challenge would let the AS render "R$ 800 to carol@…". Keycloak's parameterized scopes are a stand-in.
-4. **Elicitation and the 403 fight over the transport.** Elicitation is a server-to-client request. On a per-request SSE stream it would commit `200` before the 403 decision. In JSON response mode the POST has no stream for server requests, and the SDK silently drops a request-related one. The lab therefore sends the elicitation **unrelated** (no `relatedRequestId`), on the standalone GET SSE stream. That works, but it depends on the client keeping the GET stream open, and it loses the request association the spec recommends. A spec-level answer: allow request-related server messages to travel on the GET stream while a JSON-mode POST is pending, or define the challenge in-band.
-5. **Elicitation is UX, not authorization.** It conveys "something is in course" and gives a cheap early exit (decline means no redirect and no 403). The authorization itself still comes from the AS.
-6. **Status-line timing.** Same root cause as item 4: in SSE mode the HTTP challenge is impossible after the tool starts.
-7. **Timeouts.** Held requests wait on a human (elicitation + browser). The SDK's 60 s default is too short. The client should raise it, or the server should send progress.
-8. **SDK behaviour today (TS SDK 1.32).** The built-in `authProvider` upscoping throws `UnauthorizedError` on an interactive redirect, so the tool call fails. Hold-and-replay keeps the step-up invisible to the model.
-9. **Session ↔ subject binding.** A step-up must not let another principal take over a session (`sub` check). `acr`/`auth_time` checks (RFC 9470) fit the same plumbing.
+1. **RAR remediation fits MCP well.** The 401 carries everything the client needs to build the authorization request (`authorization_details`), and RFC 9728 points it at the AS. No out-of-band knowledge of the tool's requirements is needed. The draft's design choice to use **401** (changed from 403) works here, because the client tells the cases apart by `error`.
+2. **Two-token client model.** The client must keep a long-lived **session token** and treat remediation tokens as **request-scoped**. An SDK that stores "the" token (like today's `authProvider`) would overwrite the session token with a token that can't call anything else. That should be called out in the MCP authorization spec.
+3. **Single use needs RS state.** OAuth has no "one-shot access token". The lab gets it from short TTL + no refresh token + `jti` consumption at the RS + exact details matching. The draft's rule of omitting `authorization_reference` for single-use tokens is what stops clients from caching them.
+4. **Atomic challenge rule.** A server MUST NOT send `insufficient_authorization` after committing side effects for that request. That's what makes the replay safe. Non-atomic work reports partial progress in-band (guard demo).
+5. **Replay identity.** `(session, JSON-RPC id)` lets the server resume the checkpointed operation and dedupe replays. An explicit operation handle would be sturdier across reconnects.
+6. **Consent shows the real operation.** Because the AS receives `authorization_details`, its consent page renders the amount, debtor and creditor. The earlier scope-based version couldn't do that.
+7. **Batch.** One remediation can carry N `authorization_details`, so one consent and one token cover N transfers.
+8. **Elicitation versus HTTP challenges.** In JSON response mode, the elicitation has to travel unrelated on the standalone GET stream, because the SDK drops request-related server messages there. Elicitation remains UX only; authorization comes from the AS.
+9. **Timeouts.** A held request waits on a human, so the SDK's 60 s default is too short.
 
 ## Troubleshooting
 
-* **`invalid_scope` for `payment-op:…`.** Keycloak started without `KC_FEATURES=parameterized-scopes`.
-* **Elicitation never shows and the call hangs ~2 min.** The client's GET SSE stream isn't open, so the elicitation had nowhere to go (finding 4). The server times out and cancels the operation.
-* **Agent can't reach `localhost:8080` for discovery.** That's expected inside a container. Keep `BACKCHANNEL_REWRITE` set.
-* **`invalid_token: unexpected "iss"`.** Keycloak was reached through a hostname that changed the issuer. Keep `KC_HOSTNAME` as is.
-* **Port 8765 busy.** Another agent run is still alive: `docker compose ps -a`.
-* **Reset everything.** `docker compose down && docker compose up -d`. The realm is re-imported fresh, and the server's ledger and operations are in-memory.
+* **`invalid_authorization_details` from the AS.** The details don't match the `money_transfer` schema. See `GET http://localhost:8080/authorization-details-types`.
+* **The browser says "Unknown or already used state".** You opened an old authorization URL. Use the latest one the agent printed.
+* **The elicitation never shows and the call hangs ~2 min.** The client's GET SSE stream isn't open. The server times out and cancels the operation.
+* **`invalid_token` after restarting `idp`.** The AS generates a new signing key on start. Restart the agent so it logs in again.
+* **The agent asks for `scope=mcp:basic` instead of the `authorization_details` on a transfer.** You're running a stale agent image. The `agent` service sits behind a profile, so `docker compose up --build` does **not** rebuild it, and `docker compose run` reuses the old image. Always start it with `docker compose run --build …` (or run `docker compose --profile agent build`). The startup banner must say `RAR remediation client`.
+* **`EACCES: permission denied, open '/app/src/index.ts'`.** The source files are owner-only (`600`). The Dockerfiles use `COPY --chown=node:node`; rebuild the images with `docker compose --profile agent build`.
+* **Reset everything.** `docker compose down && docker compose up -d`. All state is in memory.

@@ -15,7 +15,7 @@ import { log } from "./log.ts";
 import { registerElicitation } from "./elicitation.ts";
 
 const MCP_URL = process.env.MCP_URL ?? "http://mcp-server:3000/mcp";
-const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-5";
+const MODEL = process.env.ANTHROPIC_MODEL ?? "claude-sonnet-4-6";
 const CALLBACK_PORT = Number(process.env.CALLBACK_PORT ?? "8765");
 // A request held for step-up waits on a human in a browser: the SDK's default
 // 60s request timeout is too short, so every MCP request gets a longer one.
@@ -28,6 +28,7 @@ const oauth = new OAuthSession(
 );
 
 // ---- MCP connection ---------------------------------------------------------
+log.tool("stepup-lab agent: session token (mcp:basic) + RAR remediation client (one-shot authorization_details tokens)");
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const mcp = new Client(
   { name: "stepup-lab-agent", version: "0.1.0" },
@@ -87,7 +88,7 @@ const oneShot = process.argv.slice(2).join(" ").trim();
 if (oneShot) {
   await turn(oneShot);
 } else {
-  console.log('Try: "what are my balances?" then "send R$ 800 to carol@pix.example from checking"');
+  console.log('Try: "what are my balances?", then "send R$ 800 to carol@pix.example from checking", then balances again');
   for (;;) {
     const q = (await rl.question("you> ")).trim();
     if (!q || q === "exit") break;

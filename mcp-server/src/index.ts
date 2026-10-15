@@ -4,9 +4,11 @@ import { getRequestListener } from "@hono/node-server";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
 import { config, prmPath } from "./config.ts";
-import { AuthError, authenticate, bearerChallenge, protectedResourceMetadata } from "./auth.ts";
+import { AuthError, authenticate, bearerChallenge, insufficientAuthorizationChallenge, protectedResourceMetadata } from "./auth.ts";
 import { newRequestContext, requestContext } from "./stepup.ts";
 import { buildServer } from "./tools.ts";
+
+const PAYMENT_TOOLS = new Set(["transfer", "naive_batch_transfer"]);
 
 type Session = { transport: WebStandardStreamableHTTPServerTransport; sub: string };
 const sessions = new Map<string, Session>();
@@ -44,6 +46,23 @@ async function handleMcp(req: Request): Promise<Response> {
 
   if (sessionId && !session) return json(404, rpcError(null, -32001, "Session not found"));
 
+  // A one-shot operation token (authorization_details only, no baseline scope) is good for
+  // exactly one thing: the tool call that executes the operation it authorizes.
+  if (principal.oneShot) {
+    const isPaymentCall =
+      req.method === "POST" && (body as any)?.method === "tools/call" && PAYMENT_TOOLS.has((body as any)?.params?.name);
+    if (!isPaymentCall) {
+      console.log(`[http] ${req.method} /mcp ${describe(body)} -> 403 (one-shot token used outside a payment call)`);
+      return json(403, rpcError((body as any)?.id, -32003, "insufficient_scope"), {
+        "www-authenticate": bearerChallenge({
+          error: "insufficient_scope",
+          scope: [config.baseScope],
+          description: "one-shot operation token can only be used for the operation it authorizes",
+        }),
+      });
+    }
+  }
+
   // A stepped-up token must belong to the same user that opened the session.
   if (session && session.sub !== principal.sub) {
     return json(401, rpcError(null, -32001, "token subject does not match session"), {
@@ -60,7 +79,7 @@ async function handleMcp(req: Request): Promise<Response> {
     const transport: WebStandardStreamableHTTPServerTransport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: () => randomUUID(),
       // JSON mode: status line is written only after the tool finishes,
-      // so a tool can still turn the response into a 403 challenge.
+      // so a tool can still turn the response into a 401 challenge.
       enableJsonResponse: true,
       onsessioninitialized: (id) => {
         sessions.set(id, { transport, sub });
@@ -80,26 +99,28 @@ async function handleMcp(req: Request): Promise<Response> {
     session.transport.handleRequest(req, { authInfo: principal, parsedBody: body }),
   );
 
-  // ---- 4. Tool asked for step-up: replace the JSON-RPC result with a 403 ---
+  // ---- 4. Tool needs authorization for this operation: replace the JSON-RPC result with
+  //         401 insufficient_authorization + authorization_remediation (RAR remediation draft)
   if (ctx.challenge) {
-    const header = bearerChallenge({
-      error: "insufficient_scope",
-      scope: ctx.challenge.scope,
-      description: ctx.challenge.reason,
-    });
-    console.log(`[http] POST /mcp ${describe(body)} -> 403 step-up (${ctx.challenge.reason})`);
+    const { header, remediation } = insufficientAuthorizationChallenge(
+      ctx.challenge.authorizationDetails,
+      `Additional authorization is required: ${ctx.challenge.reason}`,
+    );
+    console.log(`[http] POST /mcp ${describe(body)} -> 401 insufficient_authorization (${ctx.challenge.reason})`);
     return json(
-      403,
-      rpcError((body as any)?.id, -32003, "insufficient_scope", {
-        scope: ctx.challenge.scope.join(" "),
-        reason: ctx.challenge.reason,
+      401,
+      // Non-normative body: the draft carries the remediation in the header only. The JSON-RPC
+      // error keeps the request id so clients that don't remediate still get a well-formed error.
+      rpcError((body as any)?.id, -32001, "insufficient_authorization", {
+        authorization_remediation: remediation,
         operation_id: ctx.challenge.operationId,
       }),
       { "www-authenticate": header },
     );
   }
 
-  console.log(`[http] ${req.method} /mcp ${describe(body)} -> ${res.status} scopes=[${principal.scopes.join(" ")}]`);
+  const who = principal.oneShot ? `one-shot token ${principal.jti}` : `scopes=[${principal.scopes.join(" ")}]`;
+  console.log(`[http] ${req.method} /mcp ${describe(body)} -> ${res.status} ${who}`);
   return res;
 }
 

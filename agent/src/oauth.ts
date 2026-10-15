@@ -3,6 +3,13 @@
  *
  *   WWW-Authenticate ─▶ resource_metadata (RFC 9728) ─▶ authorization_servers[0]
  *   ─▶ AS metadata (OIDC discovery / RFC 8414) ─▶ /authorize (browser) ─▶ /token
+ *
+ * Two kinds of grants:
+ *  - Session grant (scope=mcp:basic): obtained on 401 without error / invalid_token, or on 403
+ *    insufficient_scope. Stored and used for every MCP request.
+ *  - One-shot operation grant (authorization_details only, NO scope): obtained from an
+ *    `insufficient_authorization` remediation (draft-ietf-oauth-rar-metadata-remediation).
+ *    Returned to the caller for a single replay and never stored; the session token is untouched.
  */
 import { createServer, type Server } from "node:http";
 import { createHash, randomBytes } from "node:crypto";
@@ -14,22 +21,34 @@ export type Challenge = {
   scope?: string[];
   resourceMetadata?: string;
   description?: string;
+  /** Decoded `authorization_remediation` (base64url JSON) when present. */
+  remediation?: { authorization_details?: AuthorizationDetail[]; authorization_reference?: string };
   raw: string;
 };
+export type AuthorizationDetail = { type: string; [k: string]: unknown };
 
 export class AuthorizationDenied extends Error {}
 
-/** Parse `Bearer k="v", k2="v2"` (RFC 6750 §3). */
+/** Parse `Bearer k="v", k2=token68ish` (RFC 6750 §3; auth-param values may be token or quoted-string). */
 export function parseBearerChallenge(status: number, header: string | null): Challenge | undefined {
   if (!header || !/^Bearer\b/i.test(header)) return undefined;
   const params: Record<string, string> = {};
-  for (const m of header.matchAll(/([a-zA-Z_]+)="((?:[^"\\]|\\.)*)"/g)) params[m[1]] = m[2];
+  for (const m of header.matchAll(/([a-zA-Z_]+)=(?:"((?:[^"\\]|\\.)*)"|([^\s,"]+))/g)) params[m[1]] = m[2] ?? m[3];
+  let remediation: Challenge["remediation"];
+  if (params.authorization_remediation) {
+    try {
+      remediation = JSON.parse(Buffer.from(params.authorization_remediation, "base64url").toString("utf8"));
+    } catch {
+      remediation = undefined; // malformed: treated as non-remediable by the caller
+    }
+  }
   return {
     status,
     error: params.error,
     scope: params.scope?.split(" ").filter(Boolean),
     resourceMetadata: params.resource_metadata,
     description: params.error_description,
+    remediation,
     raw: header,
   };
 }
@@ -43,7 +62,19 @@ const rewrites = (process.env.BACKCHANNEL_REWRITE ?? "")
   .map((p) => p.split("=") as [string, string]);
 const backchannel = (url: string) => rewrites.reduce((u, [from, to]) => (u.startsWith(from) ? to + u.slice(from.length) : u), url);
 
-type AsMetadata = { issuer: string; authorization_endpoint: string; token_endpoint: string };
+type AsMetadata = {
+  issuer: string;
+  authorization_endpoint: string;
+  token_endpoint: string;
+  authorization_details_types_supported?: string[];
+};
+
+type TokenResponse = {
+  access_token: string;
+  expires_in?: number;
+  scope?: string;
+  authorization_details?: AuthorizationDetail[];
+};
 
 export class OAuthSession {
   private accessToken?: string;
@@ -62,6 +93,7 @@ export class OAuthSession {
     this.callbackPort = callbackPort;
   }
 
+  /** The session token (baseline scope). Never replaced by a one-shot token. */
   get token() {
     return this.accessToken;
   }
@@ -69,64 +101,96 @@ export class OAuthSession {
     return this.grantedScopes;
   }
 
+  // ---- Session grant -------------------------------------------------------------
+
   /** Single-flight: concurrent requests hitting a challenge share one authorization. */
   authorize(ch: Challenge): Promise<void> {
-    this.inflight ??= this.runAuthorization(ch).finally(() => (this.inflight = undefined));
+    this.inflight ??= this.runSessionAuthorization(ch).finally(() => (this.inflight = undefined));
     return this.inflight;
   }
 
-  private async runAuthorization(ch: Challenge) {
-    // 1. Discover AS from the protected resource metadata.
-    if (ch.resourceMetadata) {
-      const prm = await getJson(backchannel(ch.resourceMetadata));
-      log.oauth(`PRM ${ch.resourceMetadata} -> resource=${prm.resource} as=${prm.authorization_servers?.[0]}`);
-      this.resource = prm.resource;
-      const issuer: string = prm.authorization_servers[0];
-      if (!this.asMeta || this.asMeta.issuer !== issuer) {
-        this.asMeta = await getJson(backchannel(`${issuer}/.well-known/openid-configuration`));
-        if (this.asMeta!.issuer !== issuer) throw new Error(`issuer mismatch: ${this.asMeta!.issuer} != ${issuer}`);
-      }
-      ch.scope ??= prm.scopes_supported;
+  private async runSessionAuthorization(ch: Challenge) {
+    const prmScopes = await this.discover(ch.resourceMetadata);
+    // On 403 insufficient_scope the server's scope list is authoritative; otherwise keep what we
+    // hold and add what the challenge / metadata suggest.
+    const requested =
+      ch.status === 403 && ch.scope?.length ? ch.scope : [...new Set([...this.grantedScopes, ...(ch.scope ?? prmScopes ?? [])])];
+    const scope = requested.join(" ");
+
+    log.oauth(`authentication needed (${ch.status}${ch.error ? ` ${ch.error}` : ""}) requesting scope="${scope}"`);
+    const tok = await this.codeFlow({ scope });
+    this.accessToken = tok.access_token;
+    this.grantedScopes = String(tok.scope ?? scope).split(" ").filter(Boolean);
+    log.oauth(`session token issued, scope="${this.grantedScopes.join(" ")}" expires_in=${tok.expires_in}s`);
+  }
+
+  // ---- One-shot operation grant (RAR remediation) ------------------------------------
+
+  /**
+   * draft-ietf-oauth-rar-metadata-remediation §7.1 step 3: send the remediation's
+   * authorization_details in a new authorization request (RFC 9396). Deliberately NO `scope`:
+   * the resulting token must authorize this operation and nothing else.
+   */
+  async authorizeOperation(ch: Challenge): Promise<string> {
+    const details = ch.remediation?.authorization_details;
+    if (!details?.length) throw new Error("insufficient_authorization without authorization_details: not remediable");
+    await this.discover(ch.resourceMetadata);
+    const unsupported = details.filter((d) => !this.asMeta!.authorization_details_types_supported?.includes(d.type));
+    if (unsupported.length) throw new Error(`AS does not support authorization_details type(s): ${unsupported.map((d) => d.type).join(", ")}`);
+
+    log.oauth(
+      `OPERATION AUTHORIZATION needed (${ch.error}): ${ch.description ?? ""}\n` +
+        `   authorization_details=${JSON.stringify(details)}\n` +
+        `   (no scope requested: one-shot token; session token kept for everything else)`,
+    );
+    const tok = await this.codeFlow({ authorization_details: JSON.stringify(details) });
+    log.oauth(
+      `one-shot token issued, scope="${tok.scope ?? ""}" authorization_details=${JSON.stringify(tok.authorization_details)} ` +
+        `expires_in=${tok.expires_in}s (used for ONE replay, then discarded)`,
+    );
+    return tok.access_token;
+  }
+
+  // ---- Shared plumbing -------------------------------------------------------------
+
+  /** PRM -> AS metadata. Returns the PRM's scopes_supported. */
+  private async discover(resourceMetadata?: string): Promise<string[] | undefined> {
+    if (!resourceMetadata) {
+      if (!this.asMeta) throw new Error("no authorization server known; challenge lacked resource_metadata");
+      return undefined;
     }
-    if (!this.asMeta) throw new Error("no authorization server known; challenge lacked resource_metadata");
+    const prm = await getJson(backchannel(resourceMetadata));
+    log.oauth(`PRM ${resourceMetadata} -> resource=${prm.resource} as=${prm.authorization_servers?.[0]}`);
+    this.resource = prm.resource;
+    const issuer: string = prm.authorization_servers[0];
+    if (!this.asMeta || this.asMeta.issuer !== issuer) {
+      const meta: AsMetadata = await getJson(backchannel(`${issuer}/.well-known/openid-configuration`));
+      if (meta.issuer !== issuer) throw new Error(`issuer mismatch: ${meta.issuer} != ${issuer}`);
+      this.asMeta = meta;
+    }
+    return prm.scopes_supported;
+  }
 
-    // 2. Scope. The server's `scope` in an insufficient_scope challenge is authoritative: it already
-    //    includes what we hold that is still useful and drops stale per-operation scopes. Without
-    //    one, keep what we hold and add what metadata suggests.
-    const scope = (
-      ch.status === 403 && ch.scope?.length ? ch.scope : [...new Set([...this.grantedScopes, ...(ch.scope ?? [])])]
-    ).join(" ");
-    const isStepUp = ch.status === 403;
-
-    // 3. Authorization code + PKCE through the user's browser.
+  /** Authorization code + PKCE through the user's browser, then the token request. */
+  private async codeFlow(extra: Record<string, string>): Promise<TokenResponse> {
     const verifier = b64url(randomBytes(32));
     const state = b64url(randomBytes(16));
-    const authUrl = new URL(this.asMeta.authorization_endpoint);
+    const authUrl = new URL(this.asMeta!.authorization_endpoint);
     authUrl.search = new URLSearchParams({
       response_type: "code",
       client_id: this.clientId,
       redirect_uri: this.redirectUri,
-      scope,
       state,
       code_challenge: b64url(createHash("sha256").update(verifier).digest()),
       code_challenge_method: "S256",
-      // Step-up authorizes a specific operation: always show the consent screen, even if the AS
-      // remembers consent for the (parameterized) scope family.
-      ...(isStepUp ? { prompt: "consent" } : {}),
+      ...extra,
       ...(this.resource ? { resource: this.resource } : {}), // RFC 8707, required by MCP auth spec
     }).toString();
-
-    log.oauth(
-      ch.status === 403
-        ? `STEP-UP needed (${ch.error}): ${ch.description ?? ""}\n   requesting scope="${scope}"`
-        : `authentication needed (${ch.status}) requesting scope="${scope}"`,
-    );
     log.prompt(`Open this URL in your browser to continue:\n\n   ${authUrl}\n`);
 
     const code = await this.waitForCallback(state);
 
-    // 4. Token request (back-channel).
-    const tokenRes = await fetch(backchannel(this.asMeta.token_endpoint), {
+    const tokenRes = await fetch(backchannel(this.asMeta!.token_endpoint), {
       method: "POST",
       headers: { "content-type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
@@ -140,9 +204,7 @@ export class OAuthSession {
     });
     const tok = await tokenRes.json();
     if (!tokenRes.ok) throw new Error(`token endpoint: ${JSON.stringify(tok)}`);
-    this.accessToken = tok.access_token;
-    this.grantedScopes = String(tok.scope ?? scope).split(" ").filter(Boolean);
-    log.oauth(`token issued, scope="${this.grantedScopes.join(" ")}" expires_in=${tok.expires_in}s`);
+    return tok;
   }
 
   /** One long-lived redirect_uri listener; pending authorizations are keyed by `state`. */

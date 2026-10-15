@@ -1,20 +1,23 @@
 /**
  * The client half of the proposal: a fetch wrapper handed to the MCP transport.
  *
- * Any MCP HTTP request (initialize, tools/call, ...) that comes back with a
- * Bearer challenge is *held*: the wrapper runs the OAuth flow the challenge
- * asks for, then replays the very same HTTP request (same JSON-RPC id, same
- * Mcp-Session-Id) with the new token. The MCP layer and the LLM only ever see
- * the final response; the step-up is transparent to them.
+ * Any MCP HTTP request (initialize, tools/call, ...) that comes back with a Bearer challenge
+ * is *held*: the wrapper runs the OAuth flow the challenge asks for, then replays the very
+ * same HTTP request (same JSON-RPC id, same Mcp-Session-Id). The MCP layer and the LLM only
+ * ever see the final response.
  *
- * Compare with the SDK's built-in authProvider path, where an interactive
- * redirect throws UnauthorizedError and the in-flight tool call fails.
+ *  - 401 (no error / invalid_token) or 403 insufficient_scope
+ *      -> (re)obtain the SESSION token, replay, keep using it afterwards.
+ *  - 401 insufficient_authorization + authorization_remediation (RAR remediation draft)
+ *      -> obtain a ONE-SHOT token for exactly the remediation's authorization_details,
+ *         replay this single request with it, discard it. The session token is untouched,
+ *         so later requests (balances, other tools) keep using it.
  */
 import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
 import { AuthorizationDenied, parseBearerChallenge, type OAuthSession } from "./oauth.ts";
 import { log } from "./log.ts";
 
-const MAX_CHALLENGES_PER_REQUEST = 2;
+const MAX_SESSION_CHALLENGES = 2;
 
 function label(init?: RequestInit): string {
   try {
@@ -30,32 +33,60 @@ export function stepUpFetch(oauth: OAuthSession): FetchLike {
   return async (url, init) => {
     const what = label(init);
     let lastHeader: string | null = null;
+    let sessionChallenges = 0;
+    let oneShotToken: string | undefined; // only ever set for the single remediation replay
+    let remediated = false;
 
     for (let attempt = 0; ; attempt++) {
       const headers = new Headers(init?.headers);
-      if (oauth.token) headers.set("authorization", `Bearer ${oauth.token}`);
+      const bearer = oneShotToken ?? oauth.token;
+      if (bearer) headers.set("authorization", `Bearer ${bearer}`);
       const res = await fetch(url, { ...init, headers });
-      log.http(`${init?.method ?? "GET"} ${what} -> ${res.status}${attempt ? ` (replay #${attempt})` : ""}`);
+      log.http(
+        `${init?.method ?? "GET"} ${what} -> ${res.status}` +
+          `${attempt ? ` (replay #${attempt})` : ""}${oneShotToken ? " [one-shot token]" : ""}`,
+      );
+      oneShotToken = undefined; // one request, then gone
 
       if (res.status !== 401 && res.status !== 403) return res;
-
       const header = res.headers.get("www-authenticate");
       const ch = parseBearerChallenge(res.status, header);
-      const actionable = ch && (res.status === 401 || ch.error === "insufficient_scope");
-      // Give up on: non-Bearer errors, too many rounds, or the same challenge right after satisfying it.
-      if (!actionable || attempt >= MAX_CHALLENGES_PER_REQUEST || header === lastHeader) return res;
-      lastHeader = header;
+      if (!ch) return res;
 
+      // ---- RAR remediation: one-shot operation token ------------------------------
+      if (res.status === 401 && ch.error === "insufficient_authorization") {
+        // No authorization_reference => tokens are single-use, nothing to look up in a cache (§7.1 step 2).
+        // After one fresh authorization, a second insufficient_authorization is non-remediable (§7.1 step 4, §7.3.3).
+        if (remediated) {
+          log.oauth("insufficient_authorization again after remediation -> giving up (no loop)");
+          return res;
+        }
+        remediated = true;
+        try {
+          oneShotToken = await oauth.authorizeOperation(ch);
+        } catch (e) {
+          log.oauth(
+            e instanceof AuthorizationDenied ? `user denied the operation: ${e.message}` : `remediation failed: ${(e as Error).message}`,
+          );
+          return res; // surface the original 401 to the MCP layer
+        }
+        continue; // replay with the one-shot token
+      }
+
+      // ---- Session token (baseline) ------------------------------------------------
+      const sessionChallenge = res.status === 401 || ch.error === "insufficient_scope";
+      if (!sessionChallenge || sessionChallenges >= MAX_SESSION_CHALLENGES || header === lastHeader) return res;
+      lastHeader = header;
+      sessionChallenges++;
       try {
         await oauth.authorize(ch);
       } catch (e) {
         if (e instanceof AuthorizationDenied) {
-          log.oauth(`user denied the step-up: ${e.message}`);
-          return res; // surface the original 403 to the MCP layer
+          log.oauth(`user denied: ${e.message}`);
+          return res;
         }
         throw e;
       }
-      // loop: replay the identical request with the new token
     }
   };
 }

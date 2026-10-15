@@ -2,45 +2,42 @@ name: mcp-stepup-lab
 
 services:
   # ---------------------------------------------------------------- IdP / AS
-  keycloak:
-    image: quay.io/keycloak/keycloak:26.8.1
-    command: ["start-dev", "--import-realm"]
+  # node-oidc-provider with Rich Authorization Requests (RFC 9396) + the authorization details
+  # types metadata endpoint (draft-ietf-oauth-rar-metadata-remediation).
+  idp:
+    build: ./idp
     environment:
-      KC_BOOTSTRAP_ADMIN_USERNAME: admin
-      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
-      # Browser-facing URL. Tokens carry iss=http://localhost:8080/realms/mcp ...
-      KC_HOSTNAME: http://localhost:8080
-      # ... while containers can still call token/JWKS endpoints via http://keycloak:8080
-      KC_HOSTNAME_BACKCHANNEL_DYNAMIC: "true"
-      KC_HEALTH_ENABLED: "true"
-      # Preview feature: `payment-op:<operation-id>` scopes bind a step-up to ONE operation
-      KC_FEATURES: parameterized-scopes
-    volumes:
-      - ./idp/realm-mcp.json:/opt/keycloak/data/import/realm-mcp.json:ro
+      # Browser-facing issuer. Containers reach the same server as http://idp:8080; the AS pins
+      # every URL it emits to the issuer, and clients rewrite back-channel calls.
+      ISSUER: http://localhost:8080
+      MCP_RESOURCE: http://mcp-server:3000/mcp
+      BASE_SCOPE: mcp:basic
+      BASE_TOKEN_TTL: "600"
+      ONE_SHOT_TOKEN_TTL: "120"
     ports:
       - "8080:8080"
     healthcheck:
-      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET /health/ready HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q UP <&3"]
-      interval: 5s
+      test: ["CMD", "node", "-e", "fetch('http://localhost:8080/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 3s
       timeout: 3s
-      retries: 40
+      retries: 20
 
   # ---------------------------------------------------------------- Resource server
   mcp-server:
     build: ./mcp-server
     environment:
       MCP_RESOURCE: http://mcp-server:3000/mcp
-      OIDC_ISSUER: http://localhost:8080/realms/mcp
-      OIDC_JWKS_URI: http://keycloak:8080/realms/mcp/protocol/openid-connect/certs
+      OIDC_ISSUER: http://localhost:8080
+      OIDC_JWKS_URI: http://idp:8080/jwks
       BASE_SCOPE: mcp:basic
-      OPERATION_SCOPE_PREFIX: "payment-op:"
+      PAYMENT_DETAILS_TYPE: money_transfer
       ELICITATION_TIMEOUT_MS: "120000"
       DEMO_UNSAFE_TOOL: "true"
       RISK_AMOUNT_THRESHOLD: "500"
     ports:
       - "3000:3000"
     depends_on:
-      keycloak:
+      idp:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "node", "-e", "fetch('http://localhost:3000/healthz').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
@@ -64,7 +61,7 @@ services:
       OAUTH_REDIRECT_URI: http://localhost:8765/callback
       CALLBACK_PORT: "8765"
       # Front-channel URLs found in metadata -> back-channel URLs reachable from this container
-      BACKCHANNEL_REWRITE: http://localhost:8080=http://keycloak:8080
+      BACKCHANNEL_REWRITE: http://localhost:8080=http://idp:8080
     ports:
       - "8765:8765"   # OAuth redirect_uri lands here from your browser
     depends_on:

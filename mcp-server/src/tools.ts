@@ -1,9 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { config } from "./config.ts";
-import { StepUpAfterCommit, commit, requireScopes } from "./stepup.ts";
+import { ChallengeAfterCommit, commit, consumeToken, requireAuthorizationDetails } from "./stepup.ts";
 import { createOperation, findByRequest, hashArgs, requestKey, setStatus, type Operation } from "./operations.ts";
-import type { Principal } from "./auth.ts";
+import type { AuthorizationDetail, Principal } from "./auth.ts";
 
 type Account = { id: string; name: string; balance: number };
 type Ledger = { accounts: Account[]; payees: Set<string>; history: string[] };
@@ -51,8 +51,9 @@ export function buildServer(): McpServer {
     },
   );
 
-  // NOTE: nothing in this tool's metadata says it may need more authorization.
-  // The need is discovered while executing, from business/risk rules.
+  // NOTE: nothing in this tool's metadata says it needs more than the session token.
+  // The need is discovered while executing: every transfer must be authorized by a one-shot
+  // token whose authorization_details (RFC 9396) describe exactly this operation.
   server.registerTool(
     "transfer",
     {
@@ -79,32 +80,29 @@ export function buildServer(): McpServer {
           console.log(`[op] ${op.id} duplicate replay -> returning stored result (no re-execution)`);
           return op.result!;
         }
-        if (op.status !== "awaiting_step_up") return fail(`Operation ${op.id} is ${op.status}; nothing was executed.`);
-        console.log(`[op] ${op.id} resumed from checkpoint (risk + user confirmation already done)`);
+        if (op.status !== "awaiting_authorization") return fail(`Operation ${op.id} is ${op.status}; nothing was executed.`);
+        console.log(`[op] ${op.id} resumed from checkpoint (validation + user confirmation already done)`);
       } else {
         // ---- First execution: read-only work only ----------------------------
         const acct = l.accounts.find((a) => a.id === from_account);
         if (!acct) return fail(`Unknown account '${from_account}'.`);
         if (acct.balance < amount) return fail(`Insufficient funds in ${acct.id}.`);
 
-        // Risk evaluation (stand-in for a PDP / OPA / risk engine call).
-        const reasons: string[] = [];
-        if (amount > config.riskAmountThreshold) reasons.push(`amount above ${brl(config.riskAmountThreshold)}`);
-        if (!l.payees.has(pix_key)) reasons.push("first transfer to this Pix key");
-        console.log(`[tool transfer] sub=${p.sub} ${brl(amount)} -> ${pix_key} risk=${reasons.join("; ") || "low"} scopes=${p.scopes.join(" ")}`);
+        // Informational risk notes shown to the user (every transfer needs authorization anyway).
+        const notes: string[] = [];
+        if (amount > config.riskAmountThreshold) notes.push(`high value (above ${brl(config.riskAmountThreshold)})`);
+        if (!l.payees.has(pix_key)) notes.push("first transfer to this Pix key");
 
-        if (!reasons.length) return commit(`transfer ${brl(amount)} -> ${pix_key}`, () => doTransfer(l, args));
-
-        // Only now do we know the grant is not enough: checkpoint the operation.
+        const detail = moneyTransferDetail(from_account, pix_key, amount);
         op = createOperation<Checkpoint>({
           sub: p.sub,
           requestKey: key,
           tool: "transfer",
           argsHash,
           summary: `${brl(amount)} from ${from_account} to ${pix_key}`,
-          checkpoint: { reasons },
+          checkpoint: { detail, notes },
         });
-        console.log(`[op] ${op.id} created (${op.summary}): ${reasons.join("; ")}`);
+        console.log(`[op] ${op.id} created (${op.summary})${notes.length ? `: ${notes.join("; ")}` : ""}`);
 
         // Tell the user something is in course, and get explicit intent BEFORE the redirect.
         const answer = await confirmWithUser(server, op);
@@ -115,14 +113,14 @@ export function buildServer(): McpServer {
           setStatus(op, "cancelled", result);
           return result;
         }
-        setStatus(op, "awaiting_step_up");
+        setStatus(op, "awaiting_authorization");
       }
 
-      // ---- Authorization for THIS operation (parameterized scope) --------------
-      requireScopes(
+      // ---- Authorization for THIS operation (RFC 9396 authorization_details) ----
+      requireAuthorizationDetails(
         extra,
-        [`${config.operationScopePrefix}${op.id}`],
-        `${op.checkpoint.reasons.join("; ")} [operation ${op.id}]`,
+        op.checkpoint.detail,
+        `${config.paymentDetailsType} for ${op.summary} [operation ${op.id}]`,
         op.id,
       );
 
@@ -134,20 +132,23 @@ export function buildServer(): McpServer {
         return result;
       }
       const result = commit(`transfer ${op.id}`, () => doTransfer(l, args, op.id));
+      consumeToken(extra); // one-shot: this token can never authorize anything again
       setStatus(op, "completed", result);
       return result;
     },
   );
 
-  // A deliberately badly-ordered tool: it commits item by item and only then
-  // discovers it needs step-up. The commit guard turns what would be a lying 403
-  // into an in-band partial-progress report.
+  // A deliberately badly-ordered tool: it first registers new payees (a side effect), and only
+  // then discovers the transfers need authorization. With new payees the commit guard turns what
+  // would be a lying 401 ("nothing happened") into an in-band partial-progress report. With known
+  // payees nothing was committed, so it challenges honestly with ONE remediation carrying N
+  // authorization_details (one consent for the whole batch).
   if (config.demoUnsafeTool) {
     server.registerTool(
       "naive_batch_transfer",
       {
         description:
-          "LAB DEMO ONLY. Executes several Pix transfers one by one, in order. Use only when the user explicitly asks for a naive batch.",
+          "LAB DEMO ONLY. Registers any new payees, then executes several Pix transfers in one call. Use only when the user explicitly asks for a naive batch.",
         inputSchema: {
           from_account: z.string(),
           items: z.array(z.object({ pix_key: z.string(), amount: z.number().positive() })).min(1),
@@ -156,37 +157,31 @@ export function buildServer(): McpServer {
       async ({ from_account, items }, extra) => {
         const p = extra.authInfo as Principal;
         const l = ledgerFor(p.sub);
-        const done: string[] = [];
-        for (const [i, it] of items.entries()) {
-          const risky = it.amount > config.riskAmountThreshold || !l.payees.has(it.pix_key);
-          try {
-            if (risky) {
-              const key = requestKey(extra.sessionId, extra.requestId);
-              const op =
-                (findByRequest(key) as Operation<Checkpoint> | undefined) ??
-                createOperation<Checkpoint>({
-                  sub: p.sub,
-                  requestKey: key,
-                  tool: "naive_batch_transfer",
-                  argsHash: hashArgs({ from_account, items }),
-                  summary: `batch item ${i + 1}: ${brl(it.amount)} -> ${it.pix_key}`,
-                  checkpoint: { reasons: ["high-risk batch item"] },
-                });
-              requireScopes(extra, [`${config.operationScopePrefix}${op.id}`], `batch item ${i + 1} is high risk`, op.id);
-            }
-            commit(`batch item ${i + 1}`, () => doTransfer(l, { from_account, ...it }));
-            done.push(`${i + 1}. ${brl(it.amount)} -> ${it.pix_key}`);
-          } catch (e) {
-            if (!(e instanceof StepUpAfterCommit)) throw e; // StepUpRequired (nothing committed yet) -> 403
-            return fail(
-              `Partially executed. Completed:\n${done.join("\n")}\n` +
-                `Stopped at item ${i + 1} (${brl(it.amount)} -> ${it.pix_key}): it needs additional authorization, ` +
-                `which cannot be requested after funds already moved in this call. Items ${i + 1}..${items.length} were NOT executed; ` +
-                `submit them as separate transfers.`,
-            );
+        const registered: string[] = [];
+        for (const it of items) {
+          if (!l.payees.has(it.pix_key)) {
+            commit(`register payee ${it.pix_key}`, () => l.payees.add(it.pix_key));
+            registered.push(it.pix_key);
           }
         }
-        return text(`Batch done:\n${done.join("\n")}`);
+        // One remediation can carry several authorization_details: one consent covers the whole batch.
+        const details = items.map((it) => moneyTransferDetail(from_account, it.pix_key, it.amount));
+        try {
+          requireAuthorizationDetails(extra, details, `batch of ${items.length} transfers`);
+        } catch (e) {
+          if (!(e instanceof ChallengeAfterCommit)) throw e; // nothing committed yet -> 401 is honest
+          return fail(
+            `Partially executed. Registered new payees: ${registered.join(", ")}.\n` +
+              `No transfer was executed: the transfers need authorization, which cannot be requested after ` +
+              `this call already changed state. Submit the transfers again (payees are now registered).`,
+          );
+        }
+        const acct = l.accounts.find((a) => a.id === from_account);
+        const total = items.reduce((s, it) => s + it.amount, 0);
+        if (!acct || acct.balance < total) return fail("Unknown account or insufficient funds; nothing executed.");
+        const done = items.map((it) => commit(`batch ${it.pix_key}`, () => doTransfer(l, { from_account, ...it })));
+        consumeToken(extra);
+        return text(`Batch done:\n${done.map((r) => r.content[0].text.split("\n")[0]).join("\n")}`);
       },
     );
   }
@@ -194,7 +189,17 @@ export function buildServer(): McpServer {
   return server;
 }
 
-type Checkpoint = { reasons: string[] };
+type Checkpoint = { detail: AuthorizationDetail; notes: string[] };
+
+/** The RFC 9396 authorization details object that authorizes exactly one transfer. */
+function moneyTransferDetail(from: string, pixKey: string, amount: number): AuthorizationDetail {
+  return {
+    type: config.paymentDetailsType,
+    debtor_account: { account_id: from },
+    creditor_account: { pix_key: pixKey },
+    instructed_amount: { currency: "BRL", amount: amount.toFixed(2) },
+  };
+}
 
 function fail(msg: string) {
   return { ...text(msg), isError: true };
@@ -214,7 +219,7 @@ function doTransfer(
 }
 
 /**
- * Pre-step-up elicitation (form mode). Not used to collect credentials: it shows the
+ * Pre-authorization elicitation (form mode). Not used to collect credentials: it shows the
  * user what is pending and gets their intent before the client is sent to the AS.
  *
  * Sent WITHOUT relatedRequestId on purpose: in JSON response mode the POST has no
@@ -222,7 +227,7 @@ function doTransfer(
  */
 async function confirmWithUser(server: McpServer, op: Operation<Checkpoint>): Promise<"proceed" | string> {
   if (!server.server.getClientCapabilities()?.elicitation) {
-    console.log(`[op] ${op.id} client has no elicitation capability -> straight to step-up`);
+    console.log(`[op] ${op.id} client has no elicitation capability -> straight to authorization`);
     return "proceed";
   }
   try {
@@ -231,8 +236,9 @@ async function confirmWithUser(server: McpServer, op: Operation<Checkpoint>): Pr
         mode: "form",
         message:
           `Pending payment ${op.id}: ${op.summary}.\n` +
-          `It needs your additional authorization because: ${op.checkpoint.reasons.join("; ")}.\n` +
-          `If you continue, you will be sent to your bank's login page to approve THIS payment only.`,
+          (op.checkpoint.notes.length ? `Notes: ${op.checkpoint.notes.join("; ")}.\n` : "") +
+          `Every payment needs your explicit approval. If you continue, you will be sent to your bank to ` +
+          `approve THIS payment only (one-time authorization).`,
         requestedSchema: {
           type: "object",
           properties: {

@@ -3,15 +3,14 @@
  *
  * - Keyed by (MCP session, JSON-RPC request id), which the client reuses on replay,
  *   so the replay resumes the operation instead of starting it over.
- * - Each operation has its own id, which becomes a parameterized scope
- *   (`payment-op:<id>`): the stepped-up token authorizes THIS operation only.
+ * - The operation's authorization_details (RFC 9396) are what the one-shot token must carry.
  * - Completed operations keep their result, so a duplicate replay returns the stored
  *   result instead of executing twice (idempotency).
  */
 import { createHash, randomBytes } from "node:crypto";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 
-export type OpStatus = "awaiting_confirmation" | "awaiting_step_up" | "completed" | "cancelled" | "failed";
+export type OpStatus = "awaiting_confirmation" | "awaiting_authorization" | "completed" | "cancelled" | "failed";
 
 export type Operation<C = unknown> = {
   id: string;
