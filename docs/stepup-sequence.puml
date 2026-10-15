@@ -1,0 +1,198 @@
+@startuml stepup-sequence
+' MCP mid-interaction step-up via WWW-Authenticate (non-elicitation authorization)
+' Matches the mcp-stepup-lab implementation: TS SDK 1.32, Keycloak 26.8 (parameterized scopes)
+
+!theme plain
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 260
+skinparam sequenceBoxBorderColor #999999
+skinparam noteBackgroundColor #FFFBE6
+skinparam noteBorderColor #C9B458
+skinparam sequenceGroupBorderColor #666666
+skinparam sequenceDividerBackgroundColor #EEF2F7
+autonumber "<b>[00]"
+
+title MCP step-up mid-interaction: 403 insufficient_scope + hold-and-replay\n(with pre-step-up elicitation, pending operation and operation-bound scope)
+
+actor "User" as U
+participant "User Agent\n(browser)" as UA
+
+box "Agent" #F3F7FF
+  participant "LLM loop\n(Claude)" as LLM
+  participant "MCP Client\n(SDK transport +\nstepUpFetch / OAuthSession)" as C
+end box
+
+box "MCP Server (Resource Server)" #F4FBF4
+  participant "HTTP layer\n(auth + 403 rewrite)" as RS
+  participant "Tool handler\n(transfer)" as T
+  database "Pending-op\nstore" as OPS
+end box
+
+participant "IdP / AS\n(Keycloak)" as AS
+
+== 0. Bootstrap: baseline authorization (401 path) ==
+
+C -> RS : POST /mcp  initialize  (no Authorization)
+RS --> C : **401** WWW-Authenticate: Bearer\n  resource_metadata="http://mcp-server:3000/.well-known/oauth-protected-resource/mcp",\n  scope="mcp:basic"
+note right of C : stepUpFetch HOLDS the request;\nthe SDK has not seen the 401
+C -> RS : GET /.well-known/oauth-protected-resource/mcp
+RS --> C : PRM {resource, authorization_servers:[iss], scopes_supported:["mcp:basic"]}\n(per-operation scopes are NOT advertised)
+C -> AS : GET {iss}/.well-known/openid-configuration  (back-channel)
+AS --> C : AS metadata (authorization_endpoint, token_endpoint); check issuer == iss
+C -> C : PKCE verifier/challenge, state
+C -> U : "Open this URL" (authorization_endpoint?scope=mcp:basic&resource=…&code_challenge=…)
+U -> UA : open URL
+UA -> AS : GET /authorize
+AS --> UA : login page
+U -> UA : alice / ****
+UA -> AS : POST credentials
+AS --> UA : consent "read your accounts" (mcp:basic)
+U -> UA : Yes
+AS --> UA : 302 redirect_uri?code=…&state=…
+UA -> C : GET http://localhost:8765/callback?code&state
+C -> AS : POST /token  (code, code_verifier, redirect_uri, resource)
+AS --> C : access_token  (aud=MCP resource, scope="mcp:basic")
+C -> RS : **replay** POST initialize  (Bearer T1)
+RS -> RS : verify JWT (sig via JWKS, iss, aud, mcp:basic)
+RS --> C : 200 InitializeResult + Mcp-Session-Id: S  (session bound to sub)
+C -> RS : POST notifications/initialized  → 202
+C -> RS : GET /mcp (standalone SSE stream, Bearer T1)
+RS --> C : 200 text/event-stream (kept open)
+note over C, RS : The standalone GET stream is what carries the elicitation later:\nin JSON response mode the POST has no stream for server→client requests.
+
+== 1. Tool call that turns out to need more authorization ==
+
+U -> LLM : "send R$ 800 to carol@pix.example from checking"
+LLM -> C : tool_use transfer{from_account, pix_key, amount}
+C -> RS : POST /mcp tools/call transfer  [JSON-RPC id=7, Mcp-Session-Id=S, Bearer T1]
+RS -> RS : verify JWT; token sub == session sub
+RS -> T : dispatch inside per-request context (AsyncLocalStorage)\nenableJsonResponse → no status line sent yet
+T -> OPS : findByRequest(S, 7)
+OPS --> T : none (first execution)
+T -> T : validate account + balance (read-only)
+T -> T : risk evaluation (read-only): amount > R$ 500, new Pix key → HIGH
+note right of T : Only now does the tool know that the\ncurrent grant is insufficient.\nNothing has been committed.
+T -> OPS : createOperation(op_X, key=(S,7), argsHash, checkpoint{reasons})\nstatus = awaiting_confirmation
+
+== 2. Pre-step-up elicitation (UX: "something is in course") ==
+
+T -> RS : elicitation/create (form)\nno relatedRequestId → routed to standalone SSE stream
+RS -->> C : SSE event: elicitation/create\n"Pending payment op_X: R$ 800 → carol… needs your authorization. Continue?"
+C -> U : terminal prompt  [Y/n/c]
+alt user declines / cancels
+  U -> C : n
+  C -> RS : POST /mcp  JSON-RPC result {action:"accept", content:{proceed:false}}
+  RS --> C : 202
+  RS -> T : elicitation result
+  T -> OPS : status = cancelled (+ stored result)
+  T --> RS : CallToolResult "op_X cancelled by the user, nothing was executed"
+  RS --> C : **200** JSON-RPC result [id=7]   (no 403, no browser)
+  C --> LLM : tool_result
+  LLM --> U : "Cancelled, no money moved"
+else user proceeds
+  U -> C : y
+  C -> RS : POST /mcp  JSON-RPC result {action:"accept", content:{proceed:true}}
+  RS --> C : 202
+  RS -> T : elicitation result
+  T -> OPS : status = awaiting_step_up
+end
+
+== 3. Step-up challenge (atomic 403) ==
+
+T -> T : requireScopes(["payment-op:op_X"])\nguard: committed[] is empty → challenge allowed
+T -> RS : record challenge in request context; throw (tool aborted)
+note right of RS : The SDK resolves the transport Response with an isError\nresult; the HTTP layer DISCARDS it and rewrites to 403.\nRule: 4xx ⇒ nothing executed for this request.
+RS --> C : **403 Forbidden**\nWWW-Authenticate: Bearer error="insufficient_scope",\n  scope="mcp:basic payment-op:op_X",\n  resource_metadata="…/oauth-protected-resource/mcp",\n  error_description="amount above R$ 500; first transfer… [operation op_X]"\nbody: JSON-RPC error {id:7, code:-32003, data:{scope, reason, operation_id:"op_X"}}
+
+== 4. Client-side step-up (request id=7 is HELD, LLM unaware) ==
+
+C -> C : parse challenge; loop guards (≤2 challenges/request, not same header twice)\nsingle-flight: concurrent requests share this authorization
+C -> RS : GET PRM (resource_metadata)
+RS --> C : PRM
+C -> C : scope = challenge scope as-is (server-authoritative,\nstale payment-op:* already dropped); new PKCE + state
+C -> U : "Open this URL"\n/authorize?scope=mcp:basic payment-op:op_X&prompt=consent&resource=…
+U -> UA : open URL
+UA -> AS : GET /authorize
+AS -> AS : SSO session exists → no password prompt;\nprompt=consent → consent screen forced
+AS --> UA : consent "Authorize the agent to execute this specific payment"
+note right of AS : The AS only knows the scope string, not the payment details.\nRAR authorization_details would let it render\n"R$ 800 to carol@…" (future work).
+alt user denies at the AS
+  U -> UA : No
+  AS --> UA : 302 redirect_uri?error=access_denied&state=…
+  UA -> C : GET /callback?error=access_denied
+  C -> C : AuthorizationDenied → release the ORIGINAL 403 to the SDK
+  C --> LLM : callTool rejects (HTTP 403 insufficient_scope, op_X)
+  LLM --> U : "Not authorized, transfer not executed"
+  note over T, OPS : op_X stays awaiting_step_up until TTL → failed.\nNo side effect was committed.
+else user approves
+  U -> UA : Yes
+  AS --> UA : 302 redirect_uri?code=…&state=…
+  UA -> C : GET /callback?code&state
+  C -> AS : POST /token (code, code_verifier, resource)
+  AS --> C : access_token T2 (scope="mcp:basic payment-op:op_X", aud=MCP resource)
+
+  == 5. Replay: same HTTP request, resumed from checkpoint ==
+
+  C -> RS : **replay** POST /mcp tools/call transfer\n[same JSON-RPC id=7, same Mcp-Session-Id=S, same body, Bearer T2]
+  RS -> RS : verify JWT T2; sub(T2) == session sub
+  RS -> T : dispatch
+  T -> OPS : findByRequest(S, 7)
+  OPS --> T : op_X (awaiting_step_up)
+  T -> T : check sub + argsHash match;\nSKIP risk evaluation and elicitation (checkpoint)
+  T -> T : requireScopes(["payment-op:op_X"]) → satisfied
+  T -> T : re-validate balance (state may have changed while user was away)
+  T -> T : commit("transfer op_X") → debit, add payee   **(only side effect)**
+  T -> OPS : status = completed, store CallToolResult
+  T --> RS : CallToolResult "Transfer done (operation op_X)…"
+  RS --> C : **200** JSON-RPC result [id=7]
+  C --> LLM : tool_result (the 401/403/elicitation/browser hops are invisible to the LLM)
+  LLM --> U : "Done: R$ 800 sent to carol@pix.example"
+end
+
+== 6. Idempotent duplicate replay (lost response / retry) ==
+
+C -> RS : POST tools/call transfer [id=7, session S, Bearer T2]  (again)
+RS -> T : dispatch
+T -> OPS : findByRequest(S, 7)
+OPS --> T : op_X (completed, stored result)
+T --> RS : stored CallToolResult (no re-execution)
+RS --> C : 200 same result, no second debit
+
+== 7. Next high-risk operation: operation-bound token does not carry over ==
+
+LLM -> C : tool_use transfer{… R$ 3000 → erin …}
+C -> RS : POST tools/call [id=8, Bearer T2]
+RS -> T : dispatch
+T -> OPS : createOperation(op_Y) → elicitation → awaiting_step_up
+T -> T : requireScopes(["payment-op:op_Y"]) → T2 only has payment-op:op_X
+RS --> C : 403 insufficient_scope, scope="mcp:basic payment-op:op_Y"
+ref over C, UA, AS : repeat phases 4–5 for op_Y (fresh consent for THIS payment)
+
+== 8. Guard: step-up requested AFTER a side effect (non-atomic tool) ==
+
+LLM -> C : tool_use naive_batch_transfer{[R$ 20 → bob, R$ 900 → zed]}
+C -> RS : POST tools/call [id=9, Bearer]
+RS -> T : dispatch
+T -> T : item 1 low risk → commit("batch item 1")  (committed[] = [item 1])
+T -> T : item 2 high risk → requireScopes(…)
+T -> T : **guard**: committed[] not empty → StepUpAfterCommit\n(NO challenge recorded: a 403 here would claim "nothing happened")
+T --> RS : CallToolResult isError "Partially executed: item 1 done;\nitems 2..n NOT executed, submit separately"
+RS --> C : **200** JSON-RPC result [id=9]  (in-band partial progress)
+C --> LLM : tool_result (error with progress report)
+
+legend bottom left
+  <b>Key properties</b>
+  • Baseline auth (401) and step-up (403) use the same challenge-driven client code (stepUpFetch).
+  • Tools never advertise the extra requirement; it is discovered during execution.
+  • Elicitation is UX (intent + "something is in course"), never the authorization itself.
+  • Atomic 403: a challenge is only allowed while nothing has been committed in the request.
+  • (Mcp-Session-Id, JSON-RPC id) identifies the pending operation across the replay.
+  • payment-op:<id> binds the stepped-up grant to ONE operation (Keycloak parameterized scope).
+  • Requires JSON response mode; client request timeout raised (5 min) for held requests.
+endlegend
+
+@enduml

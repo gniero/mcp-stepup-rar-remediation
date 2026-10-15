@@ -1,0 +1,38 @@
+# Dependencies
+node_modules/
+
+# Secrets / local config (keep .env.example tracked)
+.env
+.env.*
+!.env.example
+
+# Logs and runtime output
+*.log
+npm-debug.log*
+logs/
+/tmp/
+/tmp/probe_body
+
+# Build / tooling output
+dist/
+*.tsbuildinfo
+coverage/
+.cache/
+
+# PlantUML tooling (keep the docs/*.puml source and rendered diagrams)
+plantuml*.jar
+
+# Local Keycloak data, if you ever add a volume or run it outside Docker
+idp/data/
+keycloak-*/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
+
+# Distribution zip of this workspace
+*.zip
