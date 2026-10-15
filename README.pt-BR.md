@@ -31,20 +31,24 @@ sequenceDiagram
     A->>M: reenvia initialize (T1) → 200, sessão S (+ stream SSE via GET)
     A->>M: tools/call get_accounts (T1) → 200
     A->>M: POST tools/call transfer(R$ 800 → carol)  [id=7, S, T1]
-    M->>M: valida (somente leitura) → cria op_X (checkpoint)
+    M->>M: valida (somente leitura) → cria op_X; detalhe = money_transfer{instruction_id: op_X, débito, recebedor, valor}
     M-->>A: elicitation/create no stream GET: "Pagamento pendente op_X … continuar?"
     U-->>A: sim
-    M-->>A: 401 Bearer error="insufficient_authorization", authorization_remediation=b64url({authorization_details:[money_transfer…]})
+    M-->>A: 401 Bearer error="insufficient_authorization", authorization_remediation=b64url({authorization_details:[detalhe]}) (ou JSON-RPC -32043 in-band)
     A->>U: navegador: /authorize?authorization_details=[…]&resource=…  (SEM scope)
-    U->>K: aprova "R$ 800,00 · checking → carol@pix.example"
-    K-->>A: token de USO ÚNICO T2 (só authorization_details, 120 s)
+    U->>K: aprova "R$ 800,00 · checking → carol@pix.example · ref op_X"
+    K-->>A: token de USO ÚNICO T2 (authorization_details com instruction_id op_X, sem scope, 120 s)
     A->>M: reenvia a MESMA requisição [id=7, S] com T2
-    M->>M: op_X retomada → detalhes conferem → commit → invalida T2 (jti)
+    M->>M: localiza op_X pelo instruction_id de T2 → reserva (executing + jti gasto) → commit uma única vez
     M-->>A: 200 resultado
     A->>M: tools/call get_accounts (T1 de novo) → 200
+    A->>M: mesma transferência de novo (reenvio / mesma idempotency_key) → 200 resultado armazenado, sem débito em dobro
 ```
 
-Uma versão detalhada em PlantUML está em `docs/stepup-sequence.puml`.
+Diagramas PlantUML detalhados (vínculo com a operação, idempotência, guard), um por binding:
+
+* `docs/stepup-http.puml`: **binding HTTP**, 401 `insufficient_authorization` e reenvio da mesma requisição (renderizado em `.svg` / `.png`).
+* `docs/stepup-stream.puml`: **binding de stream / in-band**, erro JSON-RPC `-32043` e nova tentativa como requisição nova que referencia a operação, via stdio ou Streamable HTTP com `CHALLENGE_BINDING=inband` (renderizado em `.svg` / `.png`).
 
 ---
 
@@ -62,7 +66,7 @@ cp .env.example .env     # coloque sua ANTHROPIC_API_KEY nele
 
 | Arquivo | O que faz |
 |---|---|
-| `money-transfer.js` | O tipo `money_transfer`: JSON Schema (servido pelo endpoint de metadados), um validador e um helper de exibição. Formato: `{type, debtor_account:{account_id}, creditor_account:{pix_key}, instructed_amount:{currency:"BRL", amount:"800.00"}}`. |
+| `money-transfer.js` | O tipo `money_transfer`: JSON Schema (servido pelo endpoint de metadados), um validador e um helper de exibição. Formato: `{type, instruction_id, debtor_account:{account_id}, creditor_account:{pix_key}, instructed_amount:{currency:"BRL", amount:"800.00"}}`. |
 | `index.js` | Configuração do oidc-provider. `resourceIndicators` emite access tokens **JWT** com `aud = http://mcp-server:3000/mcp`: 600 s para o grant de sessão e 120 s para um grant de operação. `richAuthorizationRequests` valida o tipo, e o code e o token carregam **apenas os `authorization_details` da requisição atual**, então nada se acumula de grants anteriores. O discovery inclui `authorization_details_types_metadata_endpoint` → `GET /authorization-details-types`. Telas próprias de login e consentimento exibem o pagamento (valor, conta de débito, recebedor). Um password grant exclusivo do laboratório atende o probe sem navegador. |
 
 * **Clientes:** `mcp-agent` (público, authorization code + PKCE, `authorization_details_types: ["money_transfer"]`) e `mcp-probe` (password grant, só para o laboratório).
@@ -118,13 +122,14 @@ docker compose run --rm mcp-server node src/stdio-probe.ts
 O `probe.sh` mostra:
 
 1. 401 sem token.
-2. Com o token de sessão, uma transferência recebe **401 `insufficient_authorization`**. O script decodifica a remediação e obtém um token de uso único só com esses detalhes.
+2. Com o token de sessão, uma transferência recebe **401 `insufficient_authorization`**. A remediação traz `instruction_id` = o id da operação pendente. O script obtém um token de uso único com exatamente esses detalhes.
 3. O token de uso único usado em `get_accounts` recebe **403**.
-4. O reenvio retorna **200**.
-5. Reenviar de novo devolve o resultado armazenado, sem débito em dobro.
-6. A mesma transferência como uma requisição **nova**, com o token já consumido, recebe **401** de novo.
-7. O lote ingênuo aciona o guard.
-8. A consulta de saldos continua funcionando com o token de sessão.
+4. Uma segunda transferência idêntica (requisição nova) recebe seu **próprio** `instruction_id`.
+5. O token aprovado para a primeira operação, apresentado na segunda requisição, é **recusado**, sem nada executado.
+6. O mesmo token na requisição para a qual foi aprovado retorna **200**. Reenviar de novo devolve o resultado armazenado, sem débito em dobro.
+7. Duas requisições novas com a mesma `idempotency_key` compartilham uma operação (mesmo `instruction_id`). Uma terceira devolve o resultado armazenado sem nova autorização, e a mesma chave com outro valor é recusada.
+8. O lote ingênuo aciona o guard.
+9. A consulta de saldos continua funcionando com o token de sessão: só as duas transferências aprovadas foram debitadas.
 
 No REPL do agente (pode escrever em português):
 
@@ -143,7 +148,7 @@ Logs: `docker compose logs -f idp mcp-server` mostra `[consent]`, `[token]` (sco
 2. **Modelo de dois tokens no cliente.** O cliente precisa manter um **token de sessão** de longa duração e tratar os tokens de remediação como **restritos à requisição**. Um SDK que guarda "o" token (como o `authProvider` atual) sobrescreveria o token de sessão por um token que não serve para mais nada. Isso deveria ser explicitado na especificação de autorização do MCP.
 3. **Uso único exige estado no RS.** O OAuth não tem "access token de uso único". O laboratório chega a isso com TTL curto + ausência de refresh token + consumo do `jti` no RS + comparação exata dos detalhes. A regra do draft de omitir o `authorization_reference` para tokens de uso único é o que impede os clientes de armazená-los em cache.
 4. **Regra do desafio atômico.** Um servidor NÃO DEVE (MUST NOT) enviar `insufficient_authorization` depois de efetivar efeitos colaterais daquela requisição. É isso que torna o reenvio seguro. Trabalho não atômico informa o progresso parcial na própria resposta (demo do guard).
-5. **Identidade do reenvio.** `(sessão, id JSON-RPC)` permite que o servidor retome a operação do checkpoint e elimine reenvios duplicados. Um identificador explícito de operação seria mais robusto entre reconexões.
+5. **Identidade do reenvio e vínculo com a operação.** `(sessão, id JSON-RPC)` permite que o servidor retome um reenvio, mas não basta para vincular uma aprovação a uma única operação. O laboratório coloca o id da operação do servidor nos detalhes (`instruction_id`), localiza a operação pelo token e a reserva de forma atômica. Veja [Vínculo com a operação e idempotência](#vínculo-com-a-operação-e-idempotência). Lacuna em aberto: o AS não consegue verificar se o cliente alterou o `instruction_id` (o servidor rejeita a divergência). Uma remediação assinada pelo servidor resolveria isso.
 6. **O consentimento mostra a operação real.** Como o AS recebe os `authorization_details`, a tela de consentimento exibe valor, conta de débito e recebedor. A versão anterior, baseada em scopes, não conseguia fazer isso.
 7. **Lote.** Uma única remediação pode carregar N `authorization_details`, então um consentimento e um token cobrem N transferências.
 8. **Elicitation versus desafios HTTP.** No modo de resposta JSON, a elicitation precisa trafegar desvinculada da requisição pelo stream GET independente, porque o SDK descarta ali as mensagens do servidor vinculadas à requisição. A elicitation continua sendo só UX; a autorização vem do AS.
@@ -183,6 +188,18 @@ O que o driver faz para ajudar modelos pequenos:
 * Remove `$schema` dos schemas das ferramentas.
 
 Espere escolhas de ferramenta piores e respostas mais lentas do que com o Claude. Modelos pequenos também podem ignorar a instrução de "não tentar de novo após uma recusa". Isso é inofensivo, porque cada transferência continua exigindo sua própria aprovação, mas você pode ser solicitado duas vezes.
+
+## Vínculo com a operação e idempotência
+
+Comparar os `authorization_details` do token só pelo valor não basta: um token para "R$ 800 de checking para carol" serviria para qualquer operação com esses valores. Por isso o laboratório vincula cada concessão a uma única instância de operação:
+
+* **`instruction_id` nos detalhes.** O tipo `money_transfer` exige `instruction_id` (padrão `op_…`; compare com o `InstrId` da ISO 20022 ou o `endToEndId` do Open Finance Brasil). O servidor o preenche com o id da operação pendente, o AS o valida e o exibe na tela de consentimento como "Payment reference", e o token o carrega. Itens de lote usam `op_<id>-1`, `op_<id>-2` e assim por diante.
+* **A operação é localizada pelo token.** Quando chega um token de pagamento, o servidor carrega a operação indicada pelo `instruction_id` e confere se o usuário, a ferramenta e o hash dos argumentos batem com a requisição. Recusa se a requisição já pertencer a outra operação (achada por `_meta`, chave de idempotência ou id da requisição). Um token aprovado para op_A não executa op_B, mesmo que as duas tenham valores e contas idênticos.
+* **A reserva é uma única mudança de estado atômica.** `awaiting_authorization → executing` acontece num único passo síncrono, junto com o registro do `jti` do token para aquela operação, antes de qualquer efeito colateral. Assim um token é gasto em exatamente uma operação, e uma operação roda uma única vez, mesmo que a execução passe a ter `await`s.
+* **Concluída significa idempotente.** Qualquer chamada posterior para uma operação concluída (reenvio, o token já gasto de novo, a mesma `idempotency_key`) devolve o resultado armazenado. Nada é executado de novo e nenhuma autorização nova é pedida.
+* **`idempotency_key` (argumento opcional da ferramenta).** Duas requisições novas com a mesma chave compartilham uma única operação e, portanto, o mesmo `instruction_id` e a mesma aprovação. Reutilizar uma chave com argumentos diferentes é recusado.
+
+Os passos 5–9 do `probe.sh` demonstram cada caso: duas transferências idênticas recebem `instruction_id`s diferentes, um token é recusado na outra operação, e uma chave de idempotência compartilhada devolve o resultado armazenado ou rejeita um valor diferente.
 
 ## Semântica da ferramenta: o que o laboratório faz a respeito
 

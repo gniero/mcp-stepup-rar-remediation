@@ -1,0 +1,176 @@
+@startuml stepup-http
+' MCP mid-interaction per-operation authorization with RAR remediation
+' (RFC 9396 + draft-ietf-oauth-rar-metadata-remediation), matching mcp-stepup-lab:
+' TS SDK 1.32, node-oidc-provider 9.12, operation binding via instruction_id
+
+!theme plain
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 300
+skinparam sequenceBoxBorderColor #999999
+skinparam noteBackgroundColor #FFFBE6
+skinparam noteBorderColor #C9B458
+skinparam sequenceGroupBorderColor #666666
+skinparam sequenceDividerBackgroundColor #EEF2F7
+autonumber "<b>[00]"
+
+title [HTTP binding] MCP mid-interaction authorization over Streamable HTTP\n401 insufficient_authorization + RAR remediation, one-shot token bound to ONE operation (CHALLENGE_BINDING=http, default)
+
+actor "User" as U
+participant "User Agent\n(browser)" as UA
+
+box "Agent" #F3F7FF
+  participant "LLM loop\n(Claude or local model)" as LLM
+  participant "MCP Client\n(stepUpFetch /\nOAuthSession)" as C
+end box
+
+box "MCP Server (Resource Server)" #F4FBF4
+  participant "HTTP layer\n(auth + 401 rewrite)" as RS
+  participant "Tool handler\n(transfer)" as T
+  database "Operation store\n(+ jti -> op)" as OPS
+end box
+
+participant "AS\n(node-oidc-provider,\nRAR enabled)" as AS
+
+== 0. Bootstrap: SESSION token (scope=mcp:basic) ==
+
+C -> RS : POST /mcp initialize (no Authorization)
+RS --> C : **401** WWW-Authenticate: Bearer scope="mcp:basic", resource_metadata="…/oauth-protected-resource/mcp"\nbody: application/problem+json (not a JSON-RPC response)
+C -> RS : GET PRM (RFC 9728)
+RS --> C : {resource, authorization_servers:[iss], scopes_supported:["mcp:basic"]}
+C -> AS : GET {iss}/.well-known/openid-configuration
+AS --> C : endpoints + authorization_details_types_supported:["money_transfer"]\n+ authorization_details_types_metadata_endpoint
+C -> U : open /auth?scope=mcp:basic&resource=…&code_challenge=…
+U -> UA : open URL
+UA -> AS : login (alice) + consent "Read your accounts and balances"
+AS --> UA : 302 redirect_uri?code
+UA -> C : GET /callback?code&state
+C -> AS : POST /token (code, code_verifier, resource)
+AS --> C : **T1** JWT (aud=MCP resource, scope="mcp:basic", 600 s)
+C -> C : store T1 as the SESSION token
+C -> RS : replay initialize (Bearer T1)
+RS --> C : 200 + Mcp-Session-Id: S (bound to sub)
+C -> RS : GET /mcp (standalone SSE stream, carries the elicitation later)
+
+== 1. Transfer: the tool discovers it needs a per-operation grant ==
+
+U -> LLM : "send R$ 800 to carol@pix.example from checking"
+LLM -> C : tool_use transfer{from_account, pix_key, amount [, idempotency_key]}
+C -> RS : POST tools/call transfer [JSON-RPC id=7, session S, Bearer T1]
+RS -> T : dispatch (JSON response mode: no status line yet)
+T -> OPS : resolve operation: token instruction_id? idempotency_key? (S, 7)?
+OPS --> T : none
+T -> T : validate account + balance (read-only)
+T -> OPS : createOperation -> **op_X** (status awaiting_confirmation)\ncheckpoint.detail = {type:"money_transfer", **instruction_id:"op_X"**,\n  debtor_account:{account_id:"checking"}, creditor_account:{pix_key:"carol@…"},\n  instructed_amount:{currency:"BRL", amount:"800.00"}}
+
+== 2. Pre-authorization elicitation (UX only) ==
+
+T -> RS : elicitation/create (form, unrelated -> standalone GET stream)
+RS -->> C : "Pending payment op_X: R$ 800.00 checking -> carol… continue?"
+C -> U : terminal prompt [Y/n/c]
+alt user declines
+  U -> C : n
+  C -> RS : JSON-RPC result {proceed:false} -> 202
+  T -> OPS : op_X = cancelled
+  RS --> C : **200** result "op_X cancelled, nothing executed" [id=7]
+  C --> LLM : tool_result
+else user proceeds
+  U -> C : y
+  C -> RS : JSON-RPC result {proceed:true} -> 202
+  T -> OPS : op_X = awaiting_authorization
+end
+
+== 3. Challenge: "authorization required" for op_X (atomic: nothing committed) ==
+
+T -> T : requireAuthorizationDetails(op_X, [detail])\nT1 has no matching details -> not granted; guard: committed[] empty
+T -> RS : record challenge (operation op_X); abort tool
+RS --> C : **401** WWW-Authenticate: Bearer error="insufficient_authorization",\n  error_description="…", authorization_remediation=base64url({"authorization_details":[detail]}),\n  resource_metadata="…"   (no authorization_reference: single-use)\nbody: application/problem+json -> JSON-RPC request id=7 is still UNANSWERED
+note right of C : stepUpFetch HOLDS request id=7; the LLM and the MCP SDK see nothing yet
+
+== 4. Client remediation: ONE-SHOT token for op_X ==
+
+C -> C : decode remediation -> authorization_details (incl. instruction_id op_X)\nNO scope parameter; session token T1 is untouched
+C -> U : open /auth?authorization_details=[detail]&resource=…&code_challenge=…
+U -> UA : open URL
+UA -> AS : GET /auth (SSO session: no login)
+AS -> AS : validate money_transfer schema (instruction_id required)
+AS --> UA : consent "Approve this payment: R$ 800.00 · checking -> carol@… · Payment reference op_X"
+alt user denies
+  UA -> C : /callback?error=access_denied
+  C --> LLM : stepUpFetch answers id=7 locally: CallToolResult **isError**\n"The user declined… nothing executed, do not retry"
+  note over T, OPS : op_X stays awaiting_authorization until TTL -> failed.\nNothing committed. T1 still valid.
+else user approves
+  UA -> C : /callback?code
+  C -> AS : POST /token (code, code_verifier, resource)
+  AS --> C : **T2** JWT: no scope, authorization_details:[detail with instruction_id op_X], 120 s, no refresh
+
+  == 5. Retry with T2: resolve by token, claim atomically, commit once ==
+
+  C -> RS : **replay SAME request** [id=7, session S, same body, Bearer T2]
+  RS -> RS : verify T2; one-shot token -> only accepted on a payment tools/call; sub == session sub
+  RS -> T : dispatch
+  T -> OPS : resolve by **token instruction_id** -> op_X\ncheck sub, tool, argsHash; this request must not belong to another op
+  T -> T : requireAuthorizationDetails(op_X): T2 details == detail (incl. instruction_id)
+  T -> OPS : **claim** (one synchronous step, before any side effect):\nop_X awaiting_authorization -> **executing**; jti(T2) -> spent on op_X
+  T -> T : re-validate balance; commit("transfer op_X") (only side effect)
+  T -> OPS : op_X = completed + stored result
+  RS --> C : **200** "Transfer done (operation op_X)"
+  C -> C : discard T2
+  C --> LLM : tool_result (challenge, consent and retry are invisible to the LLM)
+end
+
+== 6. Later calls keep using the SESSION token ==
+
+LLM -> C : tool_use get_accounts
+C -> RS : tools/call get_accounts [Bearer **T1**]
+RS --> C : 200 balances (no login, no consent)
+
+== 7. Idempotency and binding ==
+
+group duplicate replay / spent token again
+  C -> RS : tools/call transfer [id=7 or new id, Bearer T2]
+  T -> OPS : resolve by T2 instruction_id -> op_X (completed)
+  RS --> C : 200 **stored result** (no re-execution, no new authorization)
+end
+group token presented on ANOTHER operation with identical values
+  note over C, RS : request id=9 is a second identical transfer -> its own op_Y (instruction_id op_Y)
+  C -> RS : tools/call transfer [id=9, Bearer T2]
+  T -> OPS : token says op_X, request belongs to op_Y
+  RS --> C : 200 isError "token is bound to op_X, this request is op_Y. Nothing executed."
+end
+group same idempotency_key on NEW requests
+  C -> RS : tools/call transfer {…, idempotency_key K} [id=20] -> challenge for op_Z
+  C -> RS : tools/call transfer {…, idempotency_key K} [id=21] -> SAME op_Z (same instruction_id)
+  C -> RS : after op_Z completes: same K [id=22, Bearer T1] -> 200 stored result
+  C -> RS : same K, different amount -> isError "idempotency_key already used with different parameters"
+end
+group one-shot token on a non-payment tool
+  C -> RS : tools/call get_accounts [Bearer T2]
+  RS --> C : 403 insufficient_scope (problem+json)
+end
+
+== 8. Guard: challenge after a side effect (non-atomic tool) ==
+
+LLM -> C : tool_use naive_batch_transfer{[R$ 20 -> new payee]}
+C -> RS : tools/call [Bearer T1]
+T -> T : register payee -> commit (committed[] not empty)
+T -> T : requireAuthorizationDetails -> **guard**: ChallengeAfterCommit (no 401)
+RS --> C : 200 isError "Partially executed: payee registered; no transfer executed"
+note over C, AS : With known payees nothing is committed first: one challenge carries N details\n(instruction_id op_B-1 … op_B-N), so one consent and one token cover the batch.
+
+legend bottom left
+  <b>Key properties</b>
+  • Tools never advertise the requirement; it is discovered during execution.
+  • HTTP binding: 401 insufficient_authorization leaves the JSON-RPC request unanswered, so the client replays the SAME id.
+    The in-band (stream) binding is in stepup-stream.puml.
+  • authorization_details carry instruction_id = the server's operation id: a grant authorizes ONE operation instance.
+  • Claim = executing + jti spent, atomically, before any side effect; completed operations return their stored result.
+  • Operation token: authorization_details only, NO scope, short TTL, no refresh. Session token (mcp:basic) is never replaced.
+  • A refusal is a tool result (isError), not a transport error. Elicitation is UX, never the authorization itself.
+  • Open gap: the AS cannot verify the RS issued the instruction_id (a server-signed remediation would close it).
+endlegend
+
+@enduml

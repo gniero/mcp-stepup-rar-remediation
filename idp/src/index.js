@@ -207,6 +207,7 @@ function consentBody(uid, details, clientName) {
     html += `<div class="pay"><div class="amt">R$ ${esc(d.instructed_amount?.amount)}</div>
 <div class="kv"><span>From (debtor account)</span><span>${esc(d.debtor_account?.account_id)}</span></div>
 <div class="kv"><span>To (creditor Pix key)</span><span>${esc(d.creditor_account?.pix_key)}</span></div>
+<div class="kv"><span>Payment reference</span><span><code>${esc(d.instruction_id)}</code></span></div>
 <div class="kv"><span>Type</span><span>${esc(d.type)}</span></div>
 <span class="tag">One-time authorization · valid for this payment only</span></div>`;
   }

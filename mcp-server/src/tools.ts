@@ -1,8 +1,19 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import { config } from "./config.ts";
-import { ChallengeAfterCommit, commit, consumeToken, requireAuthorizationDetails } from "./stepup.ts";
-import { createOperation, findById, findByRequest, hashArgs, requestKey, setStatus, type Operation } from "./operations.ts";
+import { ChallengeAfterCommit, commit, requireAuthorizationDetails, type Extra } from "./stepup.ts";
+import {
+  createOperation,
+  findById,
+  findByIdempotencyKey,
+  findByRequest,
+  hashArgs,
+  instructionId,
+  operationIdsIn,
+  requestKey,
+  setStatus,
+  type Operation,
+} from "./operations.ts";
 import { META_OPERATION_ID } from "./challenge.ts";
 import type { AuthorizationDetail, Principal } from "./auth.ts";
 
@@ -54,7 +65,8 @@ export function buildServer(): McpServer {
 
   // NOTE: nothing in this tool's metadata says it needs more than the session token.
   // The need is discovered while executing: every transfer must be authorized by a one-shot
-  // token whose authorization_details (RFC 9396) describe exactly this operation.
+  // token whose authorization_details (RFC 9396) describe exactly this operation INSTANCE
+  // (instruction_id = operation id).
   server.registerTool(
     "transfer",
     {
@@ -64,29 +76,31 @@ export function buildServer(): McpServer {
         pix_key: z.string().describe("Destination Pix key"),
         amount: z.number().positive().describe("Amount in BRL"),
         description: z.string().optional(),
+        idempotency_key: z
+          .string()
+          .min(8)
+          .optional()
+          .describe("Optional client-generated unique key. Repeating a call with the same key never creates a second transfer."),
       },
     },
     async (args, extra) => {
       const { from_account, pix_key, amount } = args;
       const p = extra.authInfo as Principal;
       const l = ledgerFor(p.sub);
-      const key = requestKey(extra.sessionId, extra.requestId);
       const argsHash = hashArgs(args);
-      // HTTP binding: the replay reuses (session, request id). In-band binding: the retry is a new
-      // request that names the pending operation in _meta.
-      const handle = (extra._meta as Record<string, unknown> | undefined)?.[META_OPERATION_ID] as string | undefined;
-      let op = (handle ? findById(handle) : findByRequest(key)) as Operation<Checkpoint> | undefined;
-      if (handle && !op) return fail(`Unknown or expired operation ${handle}; nothing was executed.`);
+
+      const found = resolveOperation<Checkpoint>(extra, "transfer", argsHash, args.idempotency_key);
+      if ("error" in found) return fail(found.error);
+      let op = found.op;
 
       if (op) {
-        // ---- Retry of an operation we have already seen ------------------------
-        if (op.sub !== p.sub || op.argsHash !== argsHash) return fail("Replay does not match the pending operation.");
+        // ---- Retry / duplicate of an operation we have already seen -------------
         if (op.status === "completed") {
-          console.log(`[op] ${op.id} duplicate replay -> returning stored result (no re-execution)`);
+          console.log(`[op] ${op.id} already completed -> returning stored result (no re-execution)`);
           return op.result!;
         }
-        if (op.status !== "awaiting_authorization") return fail(`Operation ${op.id} is ${op.status}; nothing was executed.`);
-        console.log(`[op] ${op.id} resumed from checkpoint (validation + user confirmation already done)`);
+        if (op.status !== "awaiting_authorization") return fail(`Operation ${op.id} is ${op.status}; nothing was executed by this call.`);
+        console.log(`[op] ${op.id} resumed (validation + user confirmation already done)`);
       } else {
         // ---- First execution: read-only work only ----------------------------
         const acct = l.accounts.find((a) => a.id === from_account);
@@ -98,14 +112,16 @@ export function buildServer(): McpServer {
         if (amount > config.riskAmountThreshold) notes.push(`high value (above ${brl(config.riskAmountThreshold)})`);
         if (!l.payees.has(pix_key)) notes.push("first transfer to this Pix key");
 
-        const detail = moneyTransferDetail(from_account, pix_key, amount);
         op = createOperation<Checkpoint>({
           sub: p.sub,
-          requestKey: key,
+          clientId: p.clientId,
+          requestKey: requestKey(extra.sessionId, extra.requestId),
           tool: "transfer",
           argsHash,
+          idempotencyKey: args.idempotency_key,
           summary: `${brl(amount)} from ${from_account} to ${pix_key}`,
-          checkpoint: { detail, notes },
+          // The required authorization_details embed the operation id: the grant is for THIS instance.
+          checkpoint: (id) => ({ detail: moneyTransferDetail(instructionId(id), from_account, pix_key, amount), notes }),
         });
         console.log(`[op] ${op.id} created (${op.summary})${notes.length ? `: ${notes.join("; ")}` : ""}`);
 
@@ -121,25 +137,29 @@ export function buildServer(): McpServer {
         setStatus(op, "awaiting_authorization");
       }
 
-      // ---- Authorization for THIS operation (RFC 9396 authorization_details) ----
+      // ---- Authorization for THIS operation; claims it (executing) + spends the token ----
       requireAuthorizationDetails(
         extra,
-        op.checkpoint.detail,
-        `${config.paymentDetailsType} for ${op.summary} [operation ${op.id}]`,
-        op.id,
+        op,
+        [op.checkpoint.detail],
+        `${config.paymentDetailsType} ${op.id}: ${op.summary}`,
       );
 
-      // ---- Authorized: re-validate (state may have changed while the user was away), then commit
+      // ---- Claimed: re-validate (state may have changed while the user was away), then commit
       const acct = l.accounts.find((a) => a.id === from_account)!;
       if (acct.balance < amount) {
         const result = fail(`Insufficient funds in ${acct.id} at execution time; operation ${op.id} failed, nothing executed.`);
         setStatus(op, "failed", result);
         return result;
       }
-      const result = commit(`transfer ${op.id}`, () => doTransfer(l, args, op.id));
-      consumeToken(extra); // one-shot: this token can never authorize anything again
-      setStatus(op, "completed", result);
-      return result;
+      try {
+        const result = commit(`transfer ${op.id}`, () => doTransfer(l, args, op.id));
+        setStatus(op, "completed", result);
+        return result;
+      } catch (e) {
+        setStatus(op, "failed", fail(`Execution failed: ${(e as Error).message}`));
+        throw e;
+      }
     },
   );
 
@@ -147,7 +167,7 @@ export function buildServer(): McpServer {
   // then discovers the transfers need authorization. With new payees the commit guard turns what
   // would be a lying 401 ("nothing happened") into an in-band partial-progress report. With known
   // payees nothing was committed, so it challenges honestly with ONE remediation carrying N
-  // authorization_details (one consent for the whole batch).
+  // authorization_details (one consent for the whole batch), each with its own instruction_id.
   if (config.demoUnsafeTool) {
     server.registerTool(
       "naive_batch_transfer",
@@ -157,18 +177,19 @@ export function buildServer(): McpServer {
         inputSchema: {
           from_account: z.string(),
           items: z.array(z.object({ pix_key: z.string(), amount: z.number().positive() })).min(1),
+          idempotency_key: z.string().min(8).optional(),
         },
       },
-      async ({ from_account, items }, extra) => {
+      async (args, extra) => {
+        const { from_account, items } = args;
         const p = extra.authInfo as Principal;
         const l = ledgerFor(p.sub);
-        const key = requestKey(extra.sessionId, extra.requestId);
-        const argsHash = hashArgs({ from_account, items });
-        const handle = (extra._meta as Record<string, unknown> | undefined)?.[META_OPERATION_ID] as string | undefined;
-        let op = (handle ? findById(handle) : findByRequest(key)) as Operation<BatchCheckpoint> | undefined;
-        if (handle && !op) return fail(`Unknown or expired operation ${handle}; nothing was executed.`);
-        if (op && (op.sub !== p.sub || op.argsHash !== argsHash)) return fail("Retry does not match the pending operation.");
+        const argsHash = hashArgs(args);
+        const found = resolveOperation<BatchCheckpoint>(extra, "naive_batch_transfer", argsHash, args.idempotency_key);
+        if ("error" in found) return fail(found.error);
+        let op = found.op;
         if (op?.status === "completed") return op.result!;
+        if (op && op.status !== "awaiting_authorization") return fail(`Operation ${op.id} is ${op.status}; nothing was executed by this call.`);
 
         const registered: string[] = [];
         if (!op) {
@@ -180,17 +201,20 @@ export function buildServer(): McpServer {
           }
           op = createOperation<BatchCheckpoint>({
             sub: p.sub,
-            requestKey: key,
+            clientId: p.clientId,
+            requestKey: requestKey(extra.sessionId, extra.requestId),
             tool: "naive_batch_transfer",
             argsHash,
+            idempotencyKey: args.idempotency_key,
             summary: `batch of ${items.length} transfers from ${from_account}`,
-            // One remediation can carry several authorization_details: one consent covers the whole batch.
-            checkpoint: { details: items.map((it) => moneyTransferDetail(from_account, it.pix_key, it.amount)) },
+            checkpoint: (id) => ({
+              details: items.map((it, i) => moneyTransferDetail(instructionId(id, i + 1), from_account, it.pix_key, it.amount)),
+            }),
           });
           setStatus(op, "awaiting_authorization");
         }
         try {
-          requireAuthorizationDetails(extra, op.checkpoint.details, `batch of ${items.length} transfers`, op.id);
+          requireAuthorizationDetails(extra, op, op.checkpoint.details, `batch ${op.id} of ${items.length} transfers`);
         } catch (e) {
           if (!(e instanceof ChallengeAfterCommit)) throw e; // nothing committed yet -> the challenge is honest
           const result = fail(
@@ -203,9 +227,12 @@ export function buildServer(): McpServer {
         }
         const acct = l.accounts.find((a) => a.id === from_account);
         const total = items.reduce((s, it) => s + it.amount, 0);
-        if (!acct || acct.balance < total) return fail("Unknown account or insufficient funds; nothing executed.");
+        if (!acct || acct.balance < total) {
+          const result = fail("Unknown account or insufficient funds; nothing executed.");
+          setStatus(op, "failed", result);
+          return result;
+        }
         const done = items.map((it) => commit(`batch ${it.pix_key}`, () => doTransfer(l, { from_account, ...it })));
-        consumeToken(extra);
         const result = text(`Batch done (operation ${op.id}):\n${done.map((r) => r.content[0].text.split("\n")[0]).join("\n")}`);
         setStatus(op, "completed", result);
         return result;
@@ -219,10 +246,66 @@ export function buildServer(): McpServer {
 type Checkpoint = { detail: AuthorizationDetail; notes: string[] };
 type BatchCheckpoint = { details: AuthorizationDetail[] };
 
-/** The RFC 9396 authorization details object that authorizes exactly one transfer. */
-function moneyTransferDetail(from: string, pixKey: string, amount: number): AuthorizationDetail {
+/**
+ * Find the operation this call belongs to (see operations.ts for the order) and check that it
+ * really is this call: same user, same tool, same arguments. A token bound to another operation,
+ * or an idempotency key reused with different arguments, is refused without side effects.
+ */
+function resolveOperation<C>(
+  extra: Extra,
+  tool: string,
+  argsHash: string,
+  idempotencyKey: string | undefined,
+): { op?: Operation<C> } | { error: string } {
+  const p = extra.authInfo as Principal;
+  const fromToken = operationIdsIn(p.authorizationDetails as { instruction_id?: unknown }[] | undefined);
+  if (fromToken.length > 1) return { error: "Token authorizes several operations; one operation per token is required." };
+  const handle = (extra._meta as Record<string, unknown> | undefined)?.[META_OPERATION_ID] as string | undefined;
+
+  let op: Operation<C> | undefined;
+  let via: string;
+  if (fromToken.length) {
+    via = "token instruction_id";
+    op = findById(fromToken[0]) as Operation<C> | undefined;
+    if (!op) return { error: `The token authorizes operation ${fromToken[0]}, which is unknown or expired. Nothing was executed.` };
+    // Strict binding in both directions: if this request already belongs to a different operation
+    // (via _meta, idempotency key or request id), the token cannot be redirected to it.
+    const own =
+      (handle && findById(handle)) ||
+      (idempotencyKey && findByIdempotencyKey(p.sub, tool, idempotencyKey)) ||
+      findByRequest(requestKey(extra.sessionId, extra.requestId));
+    if (own && own.id !== op.id)
+      return { error: `The token is bound to operation ${op.id}, but this request is operation ${own.id}. Nothing was executed.` };
+  } else if (handle) {
+    via = "_meta operation_id";
+    op = findById(handle) as Operation<C> | undefined;
+    if (!op) return { error: `Unknown or expired operation ${handle}; nothing was executed.` };
+  } else if (idempotencyKey) {
+    via = "idempotency_key";
+    op = findByIdempotencyKey(p.sub, tool, idempotencyKey) as Operation<C> | undefined;
+  } else {
+    via = "(session, request id)";
+    op = findByRequest(requestKey(extra.sessionId, extra.requestId)) as Operation<C> | undefined;
+  }
+  if (!op) return {};
+  if (op.sub !== p.sub || op.tool !== tool)
+    return { error: `Operation ${op.id} belongs to another user or tool. Nothing was executed.` };
+  if (op.argsHash !== argsHash)
+    return {
+      error:
+        via === "idempotency_key"
+          ? `idempotency_key already used for operation ${op.id} with different parameters. Nothing was executed.`
+          : `This request does not match operation ${op.id} (found via ${via}). Nothing was executed.`,
+    };
+  console.log(`[op] ${op.id} matched via ${via} (status ${op.status})`);
+  return { op };
+}
+
+/** The RFC 9396 authorization details object that authorizes exactly one transfer instance. */
+function moneyTransferDetail(instruction_id: string, from: string, pixKey: string, amount: number): AuthorizationDetail {
   return {
     type: config.paymentDetailsType,
+    instruction_id,
     debtor_account: { account_id: from },
     creditor_account: { pix_key: pixKey },
     instructed_amount: { currency: "BRL", amount: amount.toFixed(2) },

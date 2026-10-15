@@ -16,8 +16,9 @@
  * challenge BEFORE any side effect. Side effects go through `commit()`, and a challenge
  * after a commit is refused by the guard below.
  *
- * One-shot tokens: a token that authorizes an operation is consumed when the operation
- * commits (by `jti`); it can never authorize anything again.
+ * Binding + one-shot: the required authorization_details embed the operation id
+ * (`instruction_id`), and the token's jti is consumed atomically when the operation is claimed for
+ * execution, so a token executes exactly one operation, exactly once.
  *
  * Needs JSON response mode (enableJsonResponse): with SSE the 200 status line is on the wire
  * before the tool runs.
@@ -26,6 +27,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { AuthorizationDetail, Principal } from "./auth.ts";
+import { setStatus, type Operation } from "./operations.ts";
 
 export type Challenge = { authorizationDetails: AuthorizationDetail[]; reason: string; operationId?: string };
 type Ctx = { challenge?: Challenge; committed: string[] };
@@ -46,8 +48,8 @@ export class AuthorizationRequired extends Error {
 /** Raised when a tool tries to challenge after it already changed state. */
 export class ChallengeAfterCommit extends Error {}
 
-/** jti of one-shot tokens already used to commit an operation. */
-const consumedTokens = new Map<string, number>();
+/** jti of one-shot tokens -> the operation that consumed them. */
+const consumedTokens = new Map<string, string>();
 
 function ctx(): Ctx {
   const c = requestContext.getStore();
@@ -69,22 +71,36 @@ const canon = (v: unknown): unknown =>
 export const sameDetail = (a: unknown, b: unknown) => JSON.stringify(canon(a)) === JSON.stringify(canon(b));
 
 /**
- * Assert the caller's token carries authorization_details entries equal to every `required` one and
- * has not been consumed yet. Otherwise abort the tool and make the HTTP layer answer 401
- * insufficient_authorization with a remediation for exactly this operation.
+ * Authorize `op` for execution and CLAIM it.
+ *
+ * Passes only if the caller's token carries authorization_details equal to every `required` one
+ * (which embed `instruction_id = op.id`, so a token for another operation never matches) and the
+ * token's jti has not been spent. On success, in one synchronous step and before any side effect:
+ *   op.status := "executing", jti := consumed by op.id
+ * so the token is spent on exactly this operation and the operation can only run once, regardless
+ * of any `await` between here and the commit.
+ *
+ * Otherwise abort the tool and make the transport answer "authorization required" with a
+ * remediation for exactly this operation (401 insufficient_authorization, or -32043 in-band).
  */
 export function requireAuthorizationDetails(
   extra: Extra,
-  required: AuthorizationDetail | AuthorizationDetail[],
+  op: Operation<unknown>,
+  required: AuthorizationDetail[],
   reason: string,
-  operationId?: string,
 ): void {
   const p = extra.authInfo as Principal;
-  const all = Array.isArray(required) ? required : [required];
-  const granted = all.every((r) => p.authorizationDetails?.some((d) => sameDetail(d, r)) ?? false);
-  const consumed = p.jti ? consumedTokens.has(p.jti) : false;
-  if (granted && !consumed) return;
-  if (granted && consumed) console.log(`[auth] token ${p.jti} already consumed (one-shot) -> new authorization needed`);
+  const granted = required.every((r) => p.authorizationDetails?.some((d) => sameDetail(d, r)) ?? false);
+  const spentOn = p.jti ? consumedTokens.get(p.jti) : undefined;
+
+  if (granted && !spentOn && op.status === "awaiting_authorization") {
+    consumedTokens.set(p.jti ?? `anon-${op.id}`, op.id);
+    op.authorizedBy = p.jti;
+    setStatus(op, "executing");
+    console.log(`[auth] one-shot token ${p.jti} consumed by ${op.id}`);
+    return;
+  }
+  if (granted && spentOn) console.log(`[auth] token ${p.jti} already spent on ${spentOn} -> new authorization needed`);
 
   const c = ctx();
   if (c.committed.length) {
@@ -95,15 +111,6 @@ export function requireAuthorizationDetails(
         `already committed in the same request: ${c.committed.join("; ")}. Not retrying automatically.`,
     );
   }
-  c.challenge = { authorizationDetails: all, reason, operationId };
+  c.challenge = { authorizationDetails: required, reason, operationId: op.id };
   throw new AuthorizationRequired(c.challenge);
-}
-
-/** Burn the one-shot token used to authorize the operation that just committed. */
-export function consumeToken(extra: Extra): void {
-  const p = extra.authInfo as Principal;
-  if (p.jti && p.oneShot) {
-    consumedTokens.set(p.jti, Number(p.expiresAt ?? 0));
-    console.log(`[auth] one-shot token ${p.jti} consumed`);
-  }
 }

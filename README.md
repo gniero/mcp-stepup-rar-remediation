@@ -31,20 +31,24 @@ sequenceDiagram
     A->>M: replay initialize (T1) → 200, session S (+ GET SSE stream)
     A->>M: tools/call get_accounts (T1) → 200
     A->>M: POST tools/call transfer(R$ 800 → carol)  [id=7, S, T1]
-    M->>M: validate (read-only) → create op_X (checkpoint)
+    M->>M: validate (read-only) → create op_X; detail = money_transfer{instruction_id: op_X, debtor, creditor, amount}
     M-->>A: elicitation/create on GET stream: "Pending payment op_X … continue?"
     U-->>A: yes
-    M-->>A: 401 Bearer error="insufficient_authorization", authorization_remediation=b64url({authorization_details:[money_transfer…]})
+    M-->>A: 401 Bearer error="insufficient_authorization", authorization_remediation=b64url({authorization_details:[detail]}) (or JSON-RPC -32043 in-band)
     A->>U: browser: /authorize?authorization_details=[…]&resource=…  (NO scope)
-    U->>K: approve "R$ 800.00 · checking → carol@pix.example"
-    K-->>A: ONE-SHOT token T2 (authorization_details only, 120 s)
+    U->>K: approve "R$ 800.00 · checking → carol@pix.example · ref op_X"
+    K-->>A: ONE-SHOT token T2 (authorization_details incl. instruction_id op_X, no scope, 120 s)
     A->>M: replay SAME request [id=7, S] with T2
-    M->>M: op_X resumed → details match → commit → burn T2 (jti)
+    M->>M: resolve op_X from T2's instruction_id → claim (executing + jti spent) → commit once
     M-->>A: 200 result
     A->>M: tools/call get_accounts (T1 again) → 200
+    A->>M: same transfer again (replay / same idempotency_key) → 200 stored result, no second debit
 ```
 
-A detailed PlantUML version is in `docs/stepup-sequence.puml`.
+Detailed PlantUML diagrams (operation binding, idempotency, guard), one per binding:
+
+* `docs/stepup-http.puml`: **HTTP binding**, 401 `insufficient_authorization` and replay of the same request (rendered `.svg` / `.png`).
+* `docs/stepup-stream.puml`: **stream / in-band binding**, JSON-RPC error `-32043` and retry as a new request naming the operation, over stdio or Streamable HTTP with `CHALLENGE_BINDING=inband` (rendered `.svg` / `.png`).
 
 ---
 
@@ -62,7 +66,7 @@ cp .env.example .env     # put your ANTHROPIC_API_KEY in it
 
 | File | What it does |
 |---|---|
-| `money-transfer.js` | The `money_transfer` type: JSON Schema (served by the metadata endpoint), a validator and a display helper. Shape: `{type, debtor_account:{account_id}, creditor_account:{pix_key}, instructed_amount:{currency:"BRL", amount:"800.00"}}`. |
+| `money-transfer.js` | The `money_transfer` type: JSON Schema (served by the metadata endpoint), a validator and a display helper. Shape: `{type, instruction_id, debtor_account:{account_id}, creditor_account:{pix_key}, instructed_amount:{currency:"BRL", amount:"800.00"}}`. |
 | `index.js` | oidc-provider config. `resourceIndicators` issues **JWT** access tokens with `aud = http://mcp-server:3000/mcp`: 600 s for the session grant, 120 s for an operation grant. `richAuthorizationRequests` validates the type, and the code and token carry **only the current request's** `authorization_details`, so nothing accumulates from earlier grants. Discovery adds `authorization_details_types_metadata_endpoint` → `GET /authorization-details-types`. Custom login and consent pages render the payment (amount, debtor, creditor). A lab-only password grant serves the headless probe. |
 
 * **Clients:** `mcp-agent` (public, auth code + PKCE, `authorization_details_types: ["money_transfer"]`) and `mcp-probe` (lab-only password grant).
@@ -118,13 +122,14 @@ docker compose run --rm mcp-server node src/stdio-probe.ts
 `probe.sh` shows:
 
 1. 401 with no token.
-2. With the session token, a transfer gets **401 `insufficient_authorization`**. The script decodes the remediation and gets a one-shot token with just those details.
+2. With the session token, a transfer gets **401 `insufficient_authorization`**. The remediation carries `instruction_id` = the pending operation id. The script gets a one-shot token with exactly those details.
 3. The one-shot token used for `get_accounts` gets **403**.
-4. The replay returns **200**.
-5. Replaying again returns the stored result, with no double debit.
-6. The same transfer as a **new** request with the consumed token gets **401** again.
-7. The naive batch triggers the guard.
-8. Balances still work with the session token.
+4. A second, identical transfer (a new request) gets its **own** `instruction_id`.
+5. The token approved for the first operation, presented on the second request, is **refused** with nothing executed.
+6. The same token on the request it was approved for returns **200**. Replaying again returns the stored result, with no double debit.
+7. Two new requests with the same `idempotency_key` share one operation (same `instruction_id`). A third returns the stored result without new authorization, and the same key with a different amount is refused.
+8. The naive batch triggers the guard.
+9. Balances still work with the session token: exactly the two approved transfers were debited.
 
 In the agent REPL:
 
@@ -143,7 +148,7 @@ Logs: `docker compose logs -f idp mcp-server` shows `[consent]`, `[token]` (scop
 2. **Two-token client model.** The client must keep a long-lived **session token** and treat remediation tokens as **request-scoped**. An SDK that stores "the" token (like today's `authProvider`) would overwrite the session token with a token that can't call anything else. That should be called out in the MCP authorization spec.
 3. **Single use needs RS state.** OAuth has no "one-shot access token". The lab gets it from short TTL + no refresh token + `jti` consumption at the RS + exact details matching. The draft's rule of omitting `authorization_reference` for single-use tokens is what stops clients from caching them.
 4. **Atomic challenge rule.** A server MUST NOT send `insufficient_authorization` after committing side effects for that request. That's what makes the replay safe. Non-atomic work reports partial progress in-band (guard demo).
-5. **Replay identity.** `(session, JSON-RPC id)` lets the server resume the checkpointed operation and dedupe replays. An explicit operation handle would be sturdier across reconnects.
+5. **Replay identity and operation binding.** `(session, JSON-RPC id)` lets the server resume a replay, but that isn't enough to bind an approval to one operation. The lab puts the server's operation id in the details (`instruction_id`), resolves the operation from the token, and claims it atomically. See [Operation binding and idempotency](#operation-binding-and-idempotency). Open gap: the AS can't verify that a client didn't alter `instruction_id` (the server rejects a mismatch). A remediation signed by the server would close that.
 6. **Consent shows the real operation.** Because the AS receives `authorization_details`, its consent page renders the amount, debtor and creditor. The earlier scope-based version couldn't do that.
 7. **Batch.** One remediation can carry N `authorization_details`, so one consent and one token cover N transfers.
 8. **Elicitation versus HTTP challenges.** In JSON response mode, the elicitation has to travel unrelated on the standalone GET stream, because the SDK drops request-related server messages there. Elicitation remains UX only; authorization comes from the AS.
@@ -183,6 +188,18 @@ What the driver does to help small models:
 * It drops `$schema` from tool schemas.
 
 Expect weaker tool choice and slower replies than with Claude. Small models may also ignore the "don't retry after a refusal" instruction. That's harmless, because every transfer still needs its own approval, but you may be asked twice.
+
+## Operation binding and idempotency
+
+Matching a token's `authorization_details` by value isn't enough: a token for "R$ 800 from checking to carol" would fit any operation with those values. The lab therefore binds every grant to one operation instance:
+
+* **`instruction_id` in the details.** The `money_transfer` type requires `instruction_id` (pattern `op_…`; compare ISO 20022 `InstrId` or Open Finance Brasil `endToEndId`). The server fills it with the pending operation's id, the AS validates it and shows it on the consent screen as "Payment reference", and the token carries it. Batch items use `op_<id>-1`, `op_<id>-2`, and so on.
+* **The operation is resolved from the token.** When a payment token arrives, the server loads the operation named by its `instruction_id` and checks that the user, the tool and the argument hash match the request. It refuses if the request already belongs to another operation (found by `_meta`, idempotency key or request id). A token approved for op_A can't execute op_B, even when both carry identical amounts and accounts.
+* **Claiming is one atomic state change.** `awaiting_authorization → executing` happens in one synchronous step, together with recording the token's `jti` against that operation, before any side effect. A token is therefore spent on exactly one operation, and an operation runs once, even if the execution later includes `await`s.
+* **Completed means idempotent.** Any later call for a completed operation (a replay, the spent token again, the same `idempotency_key`) returns the stored result. Nothing is executed again and no new authorization is requested.
+* **`idempotency_key` (optional tool argument).** Two new requests with the same key share one operation, and therefore the same `instruction_id` and approval. Reusing a key with different arguments is refused.
+
+`probe.sh` steps 5–9 demonstrate each case: two identical transfers get different `instruction_id`s, a token is refused on the other operation, and a shared idempotency key returns the stored result or rejects a different amount.
 
 ## Tool semantics: what the lab does about them
 
