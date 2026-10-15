@@ -15,7 +15,7 @@ A docker compose workspace to validate this proposal. **An MCP tool finds out _w
 |---|---|---|
 | **IdP / AS** | `idp/` | [node-oidc-provider](https://github.com/panva/node-oidc-provider) 9.12 with RAR, the `money_transfer` type, a consent page that renders the payment, and the `authorization_details_types_metadata_endpoint` |
 | **MCP server** | `mcp-server/` | Streamable HTTP resource server (TS SDK 1.32), toy Pix bank, RFC 9728 metadata, pending-operation store, RAR remediation |
-| **Agent** | `agent/` | Claude tool-use loop over an MCP client that answers form elicitation and handles Bearer challenges (session and one-shot) |
+| **Agent** | `agent/` | LLM tool-use loop (Claude, or a local model through an OpenAI-compatible API) over an MCP client that answers form elicitation and handles Bearer challenges (session and one-shot) |
 
 ```mermaid
 sequenceDiagram
@@ -51,7 +51,7 @@ A detailed PlantUML version is in `docs/stepup-sequence.puml`.
 ## Step 0: prerequisites
 
 * Docker Desktop (Compose v2.24+)
-* An Anthropic API key (for the agent only; the curl probe doesn't need it)
+* An Anthropic API key **or** a local model (see [Running with a local LLM](#running-with-a-local-llm)); the curl probe needs neither
 * Ports 8080, 3000 and 8765 free on the host
 
 ```bash
@@ -90,7 +90,8 @@ cp .env.example .env     # put your ANTHROPIC_API_KEY in it
 | `inband.ts` | `callToolWithAuthorization()`: on JSON-RPC error **-32043** it runs the same one-shot authorization, then **retries as a new `tools/call`** with `_meta["lab.stepup/operation_id"]`. The server resumes the checkpoint, with no second elicitation. The one-shot token is attached to exactly that request (`oauth.armOneShot`). A denial again becomes an `isError` result. |
 | `oauth.ts` | Discovery (PRM → AS metadata, issuer check, `authorization_details_types_supported` check). The code flow + PKCE + `resource` is shared by the session grant (`scope=…`) and the operation grant (`authorization_details=…`, **no scope**). The session token is never overwritten by an operation token. |
 | `elicitation.ts` | Form elicitation in the terminal (`Y/n/c`). |
-| `index.ts` | Claude tool-use loop. Declares the elicitation capability, with a 5 min timeout for held requests. |
+| `index.ts` | Connects MCP, wires `callToolWithAuthorization` into the LLM loop. Declares the elicitation capability, with a 5 min timeout for held requests. |
+| `llm.ts` | LLM drivers: `anthropic` (Claude) and `openai` (any OpenAI-compatible server, e.g. a local Ollama model). See [Running with a local LLM](#running-with-a-local-llm). |
 
 ## Step 4: run it
 
@@ -147,6 +148,41 @@ Logs: `docker compose logs -f idp mcp-server` shows `[consent]`, `[token]` (scop
 7. **Batch.** One remediation can carry N `authorization_details`, so one consent and one token cover N transfers.
 8. **Elicitation versus HTTP challenges.** In JSON response mode, the elicitation has to travel unrelated on the standalone GET stream, because the SDK drops request-related server messages there. Elicitation remains UX only; authorization comes from the AS.
 9. **Timeouts.** A held request waits on a human, so the SDK's 60 s default is too short.
+
+## Running with a local LLM
+
+The model only decides which tool to call. Login, step-up, one-shot tokens and replays all live in the MCP client, so a local model exercises exactly the same authorization flow. `agent/src/llm.ts` has two drivers:
+
+* `LLM_PROVIDER=anthropic` (default): Claude via `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`.
+* `LLM_PROVIDER=openai`: any OpenAI-compatible `/v1/chat/completions` server with tool calling, such as Ollama, LM Studio, llama.cpp server or vLLM.
+
+On a Mac, run the model **natively, not in Docker**. Docker Desktop can't use the Apple GPU, so a model inside a container would be CPU-only. The agent container reaches the host through `host.docker.internal`.
+
+```bash
+# 1. on the Mac (Ollama app or `brew install ollama`)
+ollama pull qwen3:8b            # a tool-calling model; ~5 GB, fine on 16 GB RAM
+ollama serve                    # skip if the Ollama menu-bar app is running
+
+# 2. in .env
+LLM_PROVIDER=openai
+LLM_MODEL=qwen3:8b
+# OPENAI_BASE_URL=http://host.docker.internal:1234/v1   # for LM Studio instead of Ollama
+
+# 3. run as usual (no Anthropic key needed)
+docker compose run --build --rm --service-ports agent
+```
+
+The startup log shows `LLM: openai-compatible / qwen3:8b @ http://host.docker.internal:11434/v1`.
+
+What the driver does to help small models:
+
+* It turns string arguments into numbers where the tool schema says number, so `"R$ 800,00"` becomes `800`. The server's own validation still rejects anything wrong.
+* It reports invalid JSON arguments back to the model as tool errors.
+* It strips `<think>…</think>` from the replies of reasoning models.
+* It caps model round-trips per message (`LLM_MAX_STEPS`, default 8).
+* It drops `$schema` from tool schemas.
+
+Expect weaker tool choice and slower replies than with Claude. Small models may also ignore the "don't retry after a refusal" instruction. That's harmless, because every transfer still needs its own approval, but you may be asked twice.
 
 ## Tool semantics: what the lab does about them
 

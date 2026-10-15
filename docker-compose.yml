@@ -64,8 +64,15 @@ services:
       CALLBACK_PORT: "8765"
       # Front-channel URLs found in metadata -> back-channel URLs reachable from this container
       BACKCHANNEL_REWRITE: http://localhost:8080=http://idp:8080
+      # LLM: "anthropic" (Claude, needs ANTHROPIC_API_KEY) or "openai" (any OpenAI-compatible server,
+      # e.g. Ollama / LM Studio running natively on the host, where it can use the GPU)
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      LLM_MODEL: ${LLM_MODEL:-}
+      OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://host.docker.internal:11434/v1}
     ports:
       - "8765:8765"   # OAuth redirect_uri lands here from your browser
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Docker Desktop has it already; needed on Linux
     depends_on:
       mcp-server:
         condition: service_healthy
