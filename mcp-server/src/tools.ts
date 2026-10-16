@@ -1,21 +1,27 @@
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  McpServer,
+  inputRequired,
+  inputResponse,
+  type CallToolResult,
+  type InputRequiredResult,
+  type ServerContext,
+} from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { config } from "./config.ts";
-import { ChallengeAfterCommit, commit, requireAuthorizationDetails, type Extra } from "./stepup.ts";
+import { ChallengeAfterCommit, commit, principal, requireAuthorizationDetails } from "./stepup.ts";
 import {
   createOperation,
   findById,
   findByIdempotencyKey,
-  findByRequest,
   hashArgs,
   instructionId,
   operationIdsIn,
-  requestKey,
   setStatus,
   type Operation,
 } from "./operations.ts";
 import { META_OPERATION_ID } from "./challenge.ts";
-import type { AuthorizationDetail, Principal } from "./auth.ts";
+import { requestStateCodec, type OperationState } from "./request-state.ts";
+import type { AuthorizationDetail } from "./auth.ts";
 
 type Account = { id: string; name: string; balance: number };
 type Ledger = { accounts: Account[]; payees: Set<string>; history: string[] };
@@ -38,29 +44,32 @@ function ledgerFor(sub: string): Ledger {
   return l;
 }
 
-const text = (t: string) => ({ content: [{ type: "text" as const, text: t }] });
+const text = (t: string): CallToolResult & { content: [{ type: "text"; text: string }] } => ({
+  content: [{ type: "text", text: t }],
+});
 const brl = (n: number) => `R$ ${n.toFixed(2)}`;
 
+/** One McpServer per request (createMcpHandler factory) or per stdio connection; state lives in module maps. */
 export function buildServer(): McpServer {
-  const server = new McpServer({ name: "stepup-lab-bank", version: "0.1.0" });
+  const server = new McpServer(
+    { name: "stepup-lab-bank", version: "0.2.0" },
+    // MRTR: every echoed requestState is HMAC-verified (and user-bound) before a handler runs.
+    { requestState: { verify: requestStateCodec.verify } },
+  );
 
   server.registerTool(
     "get_accounts",
-    { description: "List the user's accounts and balances.", inputSchema: {} },
-    async (_args, extra) => {
-      const p = extra.authInfo as Principal;
-      const l = ledgerFor(p.sub);
+    { description: "List the user's accounts and balances.", inputSchema: z.object({}) },
+    async () => {
+      const l = ledgerFor(principal().sub);
       return text(l.accounts.map((a) => `${a.id} (${a.name}): ${brl(a.balance)}`).join("\n"));
     },
   );
 
   server.registerTool(
     "list_payees",
-    { description: "List payees (Pix keys) the user has paid before.", inputSchema: {} },
-    async (_args, extra) => {
-      const p = extra.authInfo as Principal;
-      return text([...ledgerFor(p.sub).payees].join("\n"));
-    },
+    { description: "List payees (Pix keys) the user has paid before.", inputSchema: z.object({}) },
+    async () => text([...ledgerFor(principal().sub).payees].join("\n")),
   );
 
   // NOTE: nothing in this tool's metadata says it needs more than the session token.
@@ -71,7 +80,7 @@ export function buildServer(): McpServer {
     "transfer",
     {
       description: "Send a Pix transfer from one of the user's accounts to a Pix key.",
-      inputSchema: {
+      inputSchema: z.object({
         from_account: z.string().describe("Account id, e.g. 'checking'"),
         pix_key: z.string().describe("Destination Pix key"),
         amount: z.number().positive().describe("Amount in BRL"),
@@ -81,15 +90,15 @@ export function buildServer(): McpServer {
           .min(8)
           .optional()
           .describe("Optional client-generated unique key. Repeating a call with the same key never creates a second transfer."),
-      },
+      }),
     },
-    async (args, extra) => {
+    async (args, ctx): Promise<CallToolResult | InputRequiredResult> => {
       const { from_account, pix_key, amount } = args;
-      const p = extra.authInfo as Principal;
+      const p = principal();
       const l = ledgerFor(p.sub);
       const argsHash = hashArgs(args);
 
-      const found = resolveOperation<Checkpoint>(extra, "transfer", argsHash, args.idempotency_key);
+      const found = await resolveOperation<Checkpoint>(ctx, "transfer", argsHash, args.idempotency_key);
       if ("error" in found) return fail(found.error);
       let op = found.op;
 
@@ -99,8 +108,9 @@ export function buildServer(): McpServer {
           console.log(`[op] ${op.id} already completed -> returning stored result (no re-execution)`);
           return op.result!;
         }
-        if (op.status !== "awaiting_authorization") return fail(`Operation ${op.id} is ${op.status}; nothing was executed by this call.`);
-        console.log(`[op] ${op.id} resumed (validation + user confirmation already done)`);
+        if (op.status !== "awaiting_authorization" && op.status !== "awaiting_confirmation")
+          return fail(`Operation ${op.id} is ${op.status}; nothing was executed by this call.`);
+        console.log(`[op] ${op.id} resumed (status ${op.status})`);
       } else {
         // ---- First execution: read-only work only ----------------------------
         const acct = l.accounts.find((a) => a.id === from_account);
@@ -115,7 +125,6 @@ export function buildServer(): McpServer {
         op = createOperation<Checkpoint>({
           sub: p.sub,
           clientId: p.clientId,
-          requestKey: requestKey(extra.sessionId, extra.requestId),
           tool: "transfer",
           argsHash,
           idempotencyKey: args.idempotency_key,
@@ -124,22 +133,18 @@ export function buildServer(): McpServer {
           checkpoint: (id) => ({ detail: moneyTransferDetail(instructionId(id), from_account, pix_key, amount), notes }),
         });
         console.log(`[op] ${op.id} created (${op.summary})${notes.length ? `: ${notes.join("; ")}` : ""}`);
+      }
 
-        // Tell the user something is in course, and get explicit intent BEFORE the redirect.
-        const answer = await confirmWithUser(server, op);
-        if (answer !== "proceed") {
-          const result = text(
-            `Operation ${op.id} cancelled by the user before authorization (${answer}). Nothing was executed.`,
-          );
-          setStatus(op, "cancelled", result);
-          return result;
-        }
+      // ---- Tell the user something is in course, and get explicit intent BEFORE the redirect.
+      //      MRTR round: input_required {confirm} + requestState {op}; the client retries with the answer.
+      if (op.status === "awaiting_confirmation") {
+        const step = await confirmationRound(server, ctx, op, found.via === "requestState");
+        if (step !== "proceed") return step;
         setStatus(op, "awaiting_authorization");
       }
 
       // ---- Authorization for THIS operation; claims it (executing) + spends the token ----
       requireAuthorizationDetails(
-        extra,
         op,
         [op.checkpoint.detail],
         `${config.paymentDetailsType} ${op.id}: ${op.summary}`,
@@ -174,18 +179,18 @@ export function buildServer(): McpServer {
       {
         description:
           "LAB DEMO ONLY. Registers any new payees, then executes several Pix transfers in one call. Use only when the user explicitly asks for a naive batch.",
-        inputSchema: {
+        inputSchema: z.object({
           from_account: z.string(),
           items: z.array(z.object({ pix_key: z.string(), amount: z.number().positive() })).min(1),
           idempotency_key: z.string().min(8).optional(),
-        },
+        }),
       },
-      async (args, extra) => {
+      async (args, ctx) => {
         const { from_account, items } = args;
-        const p = extra.authInfo as Principal;
+        const p = principal();
         const l = ledgerFor(p.sub);
         const argsHash = hashArgs(args);
-        const found = resolveOperation<BatchCheckpoint>(extra, "naive_batch_transfer", argsHash, args.idempotency_key);
+        const found = await resolveOperation<BatchCheckpoint>(ctx, "naive_batch_transfer", argsHash, args.idempotency_key);
         if ("error" in found) return fail(found.error);
         let op = found.op;
         if (op?.status === "completed") return op.result!;
@@ -202,7 +207,6 @@ export function buildServer(): McpServer {
           op = createOperation<BatchCheckpoint>({
             sub: p.sub,
             clientId: p.clientId,
-            requestKey: requestKey(extra.sessionId, extra.requestId),
             tool: "naive_batch_transfer",
             argsHash,
             idempotencyKey: args.idempotency_key,
@@ -214,7 +218,7 @@ export function buildServer(): McpServer {
           setStatus(op, "awaiting_authorization");
         }
         try {
-          requireAuthorizationDetails(extra, op, op.checkpoint.details, `batch ${op.id} of ${items.length} transfers`);
+          requireAuthorizationDetails(op, op.checkpoint.details, `batch ${op.id} of ${items.length} transfers`);
         } catch (e) {
           if (!(e instanceof ChallengeAfterCommit)) throw e; // nothing committed yet -> the challenge is honest
           const result = fail(
@@ -251,16 +255,18 @@ type BatchCheckpoint = { details: AuthorizationDetail[] };
  * really is this call: same user, same tool, same arguments. A token bound to another operation,
  * or an idempotency key reused with different arguments, is refused without side effects.
  */
-function resolveOperation<C>(
-  extra: Extra,
+async function resolveOperation<C>(
+  ctx: ServerContext,
   tool: string,
   argsHash: string,
   idempotencyKey: string | undefined,
-): { op?: Operation<C> } | { error: string } {
-  const p = extra.authInfo as Principal;
+): Promise<{ op?: Operation<C>; via?: string } | { error: string }> {
+  const p = principal();
   const fromToken = operationIdsIn(p.authorizationDetails as { instruction_id?: unknown }[] | undefined);
   if (fromToken.length > 1) return { error: "Token authorizes several operations; one operation per token is required." };
-  const handle = (extra._meta as Record<string, unknown> | undefined)?.[META_OPERATION_ID] as string | undefined;
+  // Already HMAC-verified and user-bound by the requestState hook (request-state.ts).
+  const fromState = ctx.mcpReq.requestState<OperationState>()?.op;
+  const handle = ctx.mcpReq._meta?.[META_OPERATION_ID] as string | undefined;
 
   let op: Operation<C> | undefined;
   let via: string;
@@ -269,13 +275,17 @@ function resolveOperation<C>(
     op = findById(fromToken[0]) as Operation<C> | undefined;
     if (!op) return { error: `The token authorizes operation ${fromToken[0]}, which is unknown or expired. Nothing was executed.` };
     // Strict binding in both directions: if this request already belongs to a different operation
-    // (via _meta, idempotency key or request id), the token cannot be redirected to it.
+    // (via requestState, _meta or idempotency key), the token cannot be redirected to it.
     const own =
+      (fromState && findById(fromState)) ||
       (handle && findById(handle)) ||
-      (idempotencyKey && findByIdempotencyKey(p.sub, tool, idempotencyKey)) ||
-      findByRequest(requestKey(extra.sessionId, extra.requestId));
+      (idempotencyKey && findByIdempotencyKey(p.sub, tool, idempotencyKey));
     if (own && own.id !== op.id)
       return { error: `The token is bound to operation ${op.id}, but this request is operation ${own.id}. Nothing was executed.` };
+  } else if (fromState) {
+    via = "requestState";
+    op = findById(fromState) as Operation<C> | undefined;
+    if (!op) return { error: `Unknown or expired operation ${fromState}; nothing was executed.` };
   } else if (handle) {
     via = "_meta operation_id";
     op = findById(handle) as Operation<C> | undefined;
@@ -284,8 +294,7 @@ function resolveOperation<C>(
     via = "idempotency_key";
     op = findByIdempotencyKey(p.sub, tool, idempotencyKey) as Operation<C> | undefined;
   } else {
-    via = "(session, request id)";
-    op = findByRequest(requestKey(extra.sessionId, extra.requestId)) as Operation<C> | undefined;
+    return {}; // a new call: no sessions, no request-id lookup (each retry has a new id)
   }
   if (!op) return {};
   if (op.sub !== p.sub || op.tool !== tool)
@@ -298,7 +307,7 @@ function resolveOperation<C>(
           : `This request does not match operation ${op.id} (found via ${via}). Nothing was executed.`,
     };
   console.log(`[op] ${op.id} matched via ${via} (status ${op.status})`);
-  return { op };
+  return { op, via };
 }
 
 /** The RFC 9396 authorization details object that authorizes exactly one transfer instance. */
@@ -330,40 +339,51 @@ function doTransfer(
 }
 
 /**
- * Pre-authorization elicitation (form mode). Not used to collect credentials: it shows the
- * user what is pending and gets their intent before the client is sent to the AS.
+ * Pre-authorization confirmation, as an MRTR round (MCP 2026-07-28). Not used to collect
+ * credentials: it shows the user what is pending and gets their intent before the client is sent
+ * to the AS.
  *
- * Sent WITHOUT relatedRequestId on purpose: in JSON response mode the POST has no
- * stream for server->client requests, so it goes out on the standalone GET SSE stream.
+ * Round 1 returns `input_required` with an embedded form elicitation and a sealed requestState
+ * naming the operation. The client asks the user and retries the SAME call with `inputResponses`
+ * and the echoed requestState; round 2 reads the answer. An answer is only trusted when the
+ * operation was found through the requestState (i.e. it answers THIS operation's question).
  */
-async function confirmWithUser(server: McpServer, op: Operation<Checkpoint>): Promise<"proceed" | string> {
+async function confirmationRound(
+  server: McpServer,
+  ctx: ServerContext,
+  op: Operation<Checkpoint>,
+  answeringThisOp: boolean,
+): Promise<"proceed" | CallToolResult | InputRequiredResult> {
   if (!server.server.getClientCapabilities()?.elicitation) {
     console.log(`[op] ${op.id} client has no elicitation capability -> straight to authorization`);
     return "proceed";
   }
-  try {
-    const r = await server.server.elicitInput(
-      {
-        mode: "form",
-        message:
-          `Pending payment ${op.id}: ${op.summary}.\n` +
-          (op.checkpoint.notes.length ? `Notes: ${op.checkpoint.notes.join("; ")}.\n` : "") +
-          `Every payment needs your explicit approval. If you continue, you will be sent to your bank to ` +
-          `approve THIS payment only (one-time authorization).`,
-        requestedSchema: {
-          type: "object",
-          properties: {
-            proceed: { type: "boolean", title: "Continue to authorization", default: true },
+  const answer = answeringThisOp ? inputResponse(ctx.mcpReq.inputResponses, "confirm") : { kind: "missing" as const };
+  if (answer.kind === "missing") {
+    console.log(`[op] ${op.id} -> input_required (confirm)`);
+    return inputRequired({
+      inputRequests: {
+        confirm: inputRequired.elicit({
+          message:
+            `Pending payment ${op.id}: ${op.summary}.\n` +
+            (op.checkpoint.notes.length ? `Notes: ${op.checkpoint.notes.join("; ")}.\n` : "") +
+            `Every payment needs your explicit approval. If you continue, you will be sent to your bank to ` +
+            `approve THIS payment only (one-time authorization).`,
+          requestedSchema: {
+            type: "object",
+            properties: { proceed: { type: "boolean", title: "Continue to authorization", default: true } },
+            required: ["proceed"],
           },
-          required: ["proceed"],
-        },
+        }),
       },
-      { timeout: config.elicitationTimeoutMs },
-    );
-    console.log(`[op] ${op.id} elicitation -> ${r.action} ${JSON.stringify(r.content ?? {})}`);
-    if (r.action === "accept" && r.content?.proceed === true) return "proceed";
-    return r.action === "accept" ? "user chose not to continue" : `elicitation ${r.action}`;
-  } catch (e) {
-    return `elicitation failed: ${(e as Error).message}`;
+      requestState: await requestStateCodec.mint({ op: op.id }, ctx),
+    });
   }
+  const outcome = answer.kind === "elicit" ? answer.action : answer.kind;
+  console.log(`[op] ${op.id} confirmation -> ${outcome} ${JSON.stringify(answer.kind === "elicit" ? answer.content ?? {} : {})}`);
+  if (answer.kind === "elicit" && answer.action === "accept" && answer.content?.proceed === true) return "proceed";
+  const why = answer.kind === "elicit" && answer.action === "accept" ? "user chose not to continue" : `elicitation ${outcome}`;
+  const result = text(`Operation ${op.id} cancelled by the user before authorization (${why}). Nothing was executed.`);
+  setStatus(op, "cancelled", result);
+  return result;
 }

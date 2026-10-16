@@ -2,30 +2,30 @@
  * Transport-independent form of the mid-tool authorization challenge.
  *
  * The abstract outcome is "AUTHORIZATION REQUIRED for these authorization_details; nothing was
- * executed". Each transport carries it in its own way:
+ * executed". Each binding carries it in its own way:
  *
  *  - Streamable HTTP, binding "http" (default): 401 + WWW-Authenticate insufficient_authorization
  *    (draft-ietf-oauth-rar-metadata-remediation). No JSON-RPC response exists for the request; the
- *    client replays the SAME request (same id) with the one-shot token. See index.ts.
+ *    client replays the SAME request with the one-shot token. See index.ts.
  *  - Any transport, binding "inband" (and always over stdio): a JSON-RPC error response with code
  *    AUTHORIZATION_REQUIRED carrying the same remediation. The request IS answered, so the client
  *    retries as a NEW request that references the pending operation in `_meta`.
  *
- * Lab-defined protocol extension (not part of MCP today):
- *   error.code   = -32043  (next to -32042 URL elicitation required)
+ * Lab-defined protocol extension (not part of MCP):
+ *   error.code   = -32010  (MCP 2026-07-28 reserves -32020..-32099 for the spec; -32000..-32019 is
+ *                           implementation-defined, so a lab code lives there)
  *   error.data   = { error, error_description, authorization_remediation: {authorization_details},
  *                    resource_metadata, operation_id }
  *   request _meta "lab.stepup/operation_id"  -> resume this pending operation
  *   request _meta "lab.stepup/access_token"  -> one-shot token, ONLY on transports without an
  *                                               Authorization header (stdio)
  */
-import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
-import { isJSONRPCRequest, type JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
+import { isJSONRPCRequest, type JSONRPCMessage, type Transport } from "@modelcontextprotocol/server";
 import { prmUrl } from "./config.ts";
 import { newRequestContext, requestContext, type Challenge } from "./stepup.ts";
 import type { Principal } from "./auth.ts";
 
-export const AUTHORIZATION_REQUIRED = -32043;
+export const AUTHORIZATION_REQUIRED = -32010;
 /** Tools a one-shot operation token may be presented to. */
 export const PAYMENT_TOOLS = new Set(["transfer", "naive_batch_transfer"]);
 export const META_OPERATION_ID = "lab.stepup/operation_id";
@@ -49,58 +49,85 @@ export function authorizationRequiredError(id: string | number, ch: Challenge): 
   } as JSONRPCMessage;
 }
 
-type InbandOptions = {
-  /** Principal to use when the transport supplies none (stdio: the session token from the environment). */
-  defaultAuth?: Principal;
-  /** Validate a token passed in request `_meta` (stdio only). */
-  authenticateMetaToken?: (token: string) => Promise<Principal>;
+/**
+ * Streamable HTTP, binding "inband": the tool's (discarded) isError result in a JSON-mode
+ * response is replaced by the AUTHORIZATION_REQUIRED JSON-RPC error, still inside a 200.
+ */
+export async function inbandHttpResponse(res: Response, ch: Challenge): Promise<Response> {
+  const body = await res.json();
+  const headers = new Headers(res.headers);
+  headers.delete("content-length");
+  return new Response(JSON.stringify(authorizationRequiredError(body.id, ch)), { status: 200, headers });
+}
+
+type StdioOptions = {
+  /** Principal for requests that carry no token of their own (the session token from the environment). */
+  defaultAuth: Principal;
+  /** Validate a token passed in request `_meta`. */
+  authenticateMetaToken: (token: string) => Promise<Principal>;
 };
 
 /**
- * Wrap a connected server transport so a challenge recorded by a tool is answered in-band: the
- * tool's (discarded) isError result is replaced by an AUTHORIZATION_REQUIRED JSON-RPC error.
- * Call AFTER `server.connect(transport)`.
+ * stdio: a Transport wrapper handed to `serveStdio` (which owns era negotiation and the pinned
+ * server instance). Every inbound request runs in a request context (principal = environment
+ * token, or a one-shot token from `_meta` on a payment tools/call), and a challenge recorded by a
+ * tool is answered in-band with AUTHORIZATION_REQUIRED instead of the tool's result.
  */
-export function bindInband(transport: Transport, opts: InbandOptions = {}) {
-  const ctxById = new Map<string | number, ReturnType<typeof newRequestContext>>();
-  const onmessage = transport.onmessage!;
-  const send = transport.send.bind(transport);
+export class StdioAuthTransport implements Transport {
+  onclose?: () => void;
+  onerror?: (error: Error) => void;
+  onmessage?: Transport["onmessage"];
+  private ctxById = new Map<string | number, ReturnType<typeof newRequestContext>>();
+  private inner: Transport;
+  private opts: StdioOptions;
 
-  transport.onmessage = (msg, extra) => {
-    if (!isJSONRPCRequest(msg)) return onmessage(msg, extra);
-    const ctx = newRequestContext();
-    ctxById.set(msg.id, ctx);
-    void (async () => {
-      let authInfo = (extra?.authInfo as Principal | undefined) ?? opts.defaultAuth;
-      const metaToken = (msg.params as any)?._meta?.[META_ACCESS_TOKEN];
-      if (metaToken && opts.authenticateMetaToken) {
-        try {
-          if (msg.method !== "tools/call") throw new Error("a _meta access token is only accepted on tools/call");
-          const p = await opts.authenticateMetaToken(metaToken);
-          if (p.oneShot && !PAYMENT_TOOLS.has((msg.params as any)?.name))
-            throw new Error("one-shot operation token can only be used for the operation it authorizes");
-          if (opts.defaultAuth && p.sub !== opts.defaultAuth.sub) throw new Error("token subject does not match session");
-          authInfo = p;
-        } catch (e) {
-          ctxById.delete(msg.id);
-          await send({ jsonrpc: "2.0", id: msg.id, error: { code: -32001, message: `invalid _meta access token: ${(e as Error).message}` } } as JSONRPCMessage);
-          return;
-        }
+  constructor(inner: Transport, opts: StdioOptions) {
+    this.inner = inner;
+    this.opts = opts;
+    inner.onclose = () => this.onclose?.();
+    inner.onerror = (e) => this.onerror?.(e);
+    inner.onmessage = (msg, extra) => void this.receive(msg, extra);
+  }
+
+  start() {
+    return this.inner.start();
+  }
+  close() {
+    return this.inner.close();
+  }
+
+  private async receive(msg: JSONRPCMessage, extra?: Parameters<NonNullable<Transport["onmessage"]>>[1]) {
+    if (!isJSONRPCRequest(msg)) return this.onmessage?.(msg, extra);
+    let authInfo = this.opts.defaultAuth;
+    const metaToken = (msg.params as any)?._meta?.[META_ACCESS_TOKEN];
+    if (metaToken) {
+      try {
+        if (msg.method !== "tools/call") throw new Error("a _meta access token is only accepted on tools/call");
+        const p = await this.opts.authenticateMetaToken(metaToken);
+        if (p.oneShot && !PAYMENT_TOOLS.has((msg.params as any)?.name))
+          throw new Error("one-shot operation token can only be used for the operation it authorizes");
+        if (p.sub !== this.opts.defaultAuth.sub) throw new Error("token subject does not match the server's user");
+        authInfo = p;
+      } catch (e) {
+        await this.inner.send({ jsonrpc: "2.0", id: msg.id, error: { code: -32011, message: `invalid _meta access token: ${(e as Error).message}` } } as JSONRPCMessage);
+        return;
       }
-      requestContext.run(ctx, () => onmessage(msg, { ...extra, authInfo }));
-    })();
-  };
+    }
+    const ctx = newRequestContext(authInfo);
+    this.ctxById.set(msg.id, ctx);
+    requestContext.run(ctx, () => this.onmessage?.(msg, extra));
+  }
 
-  transport.send = async (msg, options) => {
+  async send(msg: JSONRPCMessage, options?: Parameters<Transport["send"]>[1]) {
     const id = (msg as any).id;
-    if (id !== undefined && ("result" in msg || "error" in msg) && ctxById.has(id)) {
-      const ctx = ctxById.get(id)!;
-      ctxById.delete(id);
+    if (id !== undefined && ("result" in msg || "error" in msg) && this.ctxById.has(id)) {
+      const ctx = this.ctxById.get(id)!;
+      this.ctxById.delete(id);
       if (ctx.challenge) {
         console.error(`[inband] request ${id} -> AUTHORIZATION_REQUIRED (${ctx.challenge.reason})`);
         msg = authorizationRequiredError(id, ctx.challenge);
       }
     }
-    return send(msg, options);
-  };
+    return this.inner.send(msg, options);
+  }
 }

@@ -2,15 +2,18 @@
  * Client-side form elicitation handler. The server uses it right before a step-up
  * challenge to show the user what is pending and get their intent, so the browser
  * redirect that follows is not a surprise.
+ *
+ * MCP 2026-07-28: the server no longer sends elicitation/create as a request. It returns an
+ * `input_required` result embedding it (MRTR); the SDK's multi-round-trip driver dispatches the
+ * embedded request to this same handler and retries the call with the answer.
  */
-import type { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { ElicitRequestSchema, type ElicitResult } from "@modelcontextprotocol/sdk/types.js";
+import type { Client, ElicitResult } from "@modelcontextprotocol/client";
 import { log } from "./log.ts";
 
 export type Ask = (question: string) => Promise<string>;
 
 export function registerElicitation(client: Client, ask: Ask) {
-  client.setRequestHandler(ElicitRequestSchema, async (req): Promise<ElicitResult> => {
+  client.setRequestHandler("elicitation/create", async (req): Promise<ElicitResult> => {
     const p = req.params;
     if (p.mode === "url") return { action: "decline" }; // not used in this lab
     log.elicit(`server asks:\n${p.message.replace(/^/gm, "   ")}`);
