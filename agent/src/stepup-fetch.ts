@@ -17,9 +17,10 @@
  * synthesized CallToolResult { isError: true } instead of surfacing a transport error: for the
  * model, "the user said no" is a tool outcome, not a protocol failure, and must not invite a retry.
  *
- * In-band binding (JSON-RPC error -32010, see inband.ts): the retry is a new request that names
- * the operation in _meta; `oauth.armOneShot()` makes this wrapper attach the one-shot token to
- * exactly that request.
+ * In-band (JSON-RPC error -32010) and MRTR (`input_required` authorization step) bindings, see
+ * call-tool.ts: the retry is a new request (naming the operation in _meta, or echoing the
+ * requestState); `oauth.armOneShot()` makes this wrapper attach the one-shot token to exactly that
+ * request.
  */
 import type { FetchLike } from "@modelcontextprotocol/client";
 import { AuthorizationDenied, parseBearerChallenge, type OAuthSession } from "./oauth.ts";
@@ -73,8 +74,9 @@ export function stepUpFetch(oauth: OAuthSession): FetchLike {
 
     for (let attempt = 0; ; attempt++) {
       const headers = new Headers(init?.headers);
-      // In-band retry: a one-shot token armed for the operation this request names in _meta.
-      oneShotToken ??= attempt === 0 ? oauth.takeArmedOneShot(parseBody(init)?.params?._meta?.["lab.stepup/operation_id"]) : undefined;
+      // In-band / MRTR retry: a one-shot token armed for exactly this request (it names the
+      // operation in _meta, or echoes the requestState of the MRTR authorization step).
+      oneShotToken ??= attempt === 0 ? oauth.takeArmedOneShot(parseBody(init)) : undefined;
       const bearer = oneShotToken ?? oauth.token;
       if (bearer) headers.set("authorization", `Bearer ${bearer}`);
       const res = await fetch(url, { ...init, headers });

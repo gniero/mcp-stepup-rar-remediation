@@ -11,7 +11,7 @@ import { config, prmPath } from "./config.ts";
 import { AuthError, authenticate, bearerChallenge, insufficientAuthorizationChallenge, protectedResourceMetadata } from "./auth.ts";
 import { newRequestContext, requestContext } from "./stepup.ts";
 import { buildServer } from "./tools.ts";
-import { PAYMENT_TOOLS, inbandHttpResponse } from "./challenge.ts";
+import { OFFERED_BINDINGS, PAYMENT_TOOLS, inbandHttpResponse } from "./challenge.ts";
 
 const mcp = createMcpHandler(() => buildServer(), {
   // JSON mode: the status line is written only after the tool finishes,
@@ -82,8 +82,9 @@ async function handleMcp(req: Request): Promise<Response> {
   const ctx = newRequestContext(principal);
   let res = await requestContext.run(ctx, () => mcp.fetch(req, { authInfo: principal, parsedBody: body }));
 
-  // ---- 3a. In-band binding: the JSON-RPC result becomes AUTHORIZATION_REQUIRED (-32010), still 200
-  if (ctx.challenge && config.challengeBinding === "inband") {
+  // ---- 3a. In-band binding (negotiated, or forced by policy): the JSON-RPC result becomes
+  //          AUTHORIZATION_REQUIRED (-32010), still 200
+  if (ctx.challenge?.binding === "inband") {
     console.log(`[http] POST /mcp ${describe(body)} -> 200 AUTHORIZATION_REQUIRED in-band (${ctx.challenge.reason})`);
     return inbandHttpResponse(res, ctx.challenge);
   }
@@ -137,6 +138,7 @@ createServer((req, res) => {
   res.writeHead(404).end();
 }).listen(config.port, () => {
   console.log(
-    `MCP server on :${config.port}${mcpPath}  resource=${config.resource}  issuer=${config.issuer}  challenge binding=${config.challengeBinding}`,
+    `MCP server on :${config.port}${mcpPath}  resource=${config.resource}  issuer=${config.issuer}  challenge binding=${config.challengeBinding}` +
+      (OFFERED_BINDINGS.length ? ` (offers ${OFFERED_BINDINGS.join(", ")} to clients that declare them; others: 401)` : ""),
   );
 });

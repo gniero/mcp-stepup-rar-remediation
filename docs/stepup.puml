@@ -1,0 +1,188 @@
+@startuml stepup
+' MCP mid-interaction per-operation authorization with RAR remediation
+' (RFC 9396 + draft-ietf-oauth-rar-metadata-remediation), matching mcp-stepup-lab:
+' MCP 2026-07-28 (stateless, MRTR), TS SDK v2, node-oidc-provider 9.12, operation binding via instruction_id.
+' One flow; the only steps that depend on the negotiated binding (http | inband | mrtr) are [3] and [5].
+
+!theme plain
+skinparam shadowing false
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign left
+skinparam responseMessageBelowArrow true
+skinparam maxMessageSize 300
+skinparam sequenceBoxBorderColor #999999
+skinparam noteBackgroundColor #FFFBE6
+skinparam noteBorderColor #C9B458
+skinparam sequenceGroupBorderColor #666666
+skinparam sequenceDividerBackgroundColor #EEF2F7
+autonumber "<b>[00]"
+
+title MCP 2026-07-28 mid-interaction authorization with RAR remediation\none-shot token bound to ONE operation; "authorization required" carried as 401, JSON-RPC error -32010 or MRTR input_required (negotiated per request)
+
+actor "User" as U
+participant "User Agent\n(browser)" as UA
+
+box "Agent" #F3F7FF
+  participant "LLM loop\n(Claude or local model)" as LLM
+  participant "MCP Client\n(call-tool.ts, stepUpFetch,\nOAuthSession)" as C
+end box
+
+box "MCP Server (Resource Server)" #F4FBF4
+  participant "Transport layer\n(createMcpHandler | stdio;\nauth, challenge rewrite)" as RS
+  participant "Tool handler\n(transfer)" as T
+  database "Operation store\n(+ jti -> op)" as OPS
+end box
+
+participant "AS\n(node-oidc-provider,\nRAR enabled)" as AS
+
+== 0. Bootstrap: SESSION token (scope=mcp:basic) and binding negotiation ==
+
+C -> RS : POST /mcp server/discover (no Authorization)\nMCP-Protocol-Version: 2026-07-28, Mcp-Method: server/discover
+RS --> C : **401** WWW-Authenticate: Bearer scope="mcp:basic", resource_metadata="…/oauth-protected-resource/mcp"
+C -> AS : PRM (RFC 9728) -> AS metadata: authorization_details_types_supported:["money_transfer"]
+C -> U : open /auth?scope=mcp:basic&resource=…&code_challenge=…
+U -> UA : open URL
+UA -> AS : login (alice) + consent "Read your accounts and balances"
+UA -> C : /callback?code&state&**iss**  (RFC 9207 check: MUST in MCP 2026-07-28)
+C -> AS : POST /token (code, code_verifier, resource)
+AS --> C : **T1** JWT (aud=MCP resource, scope="mcp:basic", 600 s): the SESSION token
+C -> RS : replay server/discover (Bearer T1)
+RS --> C : 200 {supportedVersions:["2026-07-28"],\n  capabilities.extensions:{"lab.stepup/rar-remediation":{bindings:["mrtr","inband"]}}}   (what the server OFFERS)
+note over C, RS : No session: every request carries _meta clientCapabilities =\n{elicitation:{form:{}}, extensions:{"lab.stepup/rar-remediation":{**bindings:[…]**}}}  (what the client HANDLES, in preference order).\nPer request, the server answers "authorization required" with the client's first preference it offers;\nnothing declared or nothing in common -> **http** (401). stdio: T1 comes from the environment (MCP_ACCESS_TOKEN),\nthe era is negotiated with server/discover, and since stdio has no 401, "http" becomes "inband".
+
+== 1. Transfer: the tool discovers it needs a per-operation grant ==
+
+U -> LLM : "send R$ 800 to carol@pix.example from checking"
+LLM -> C : tool_use transfer{from_account, pix_key, amount [, idempotency_key]}
+C -> RS : tools/call transfer [JSON-RPC id=2, Bearer T1]  (manual MRTR mode: allowInputRequired)
+RS -> T : dispatch to a per-request server (JSON response mode: no status line yet)
+T -> OPS : resolve operation: token instruction_id? requestState? _meta operation_id? idempotency_key?
+OPS --> T : none
+T -> T : validate account + balance (read-only)
+T -> OPS : createOperation -> **op_X**\ndetail = {type:"money_transfer", **instruction_id:"op_X"**, debtor_account:{account_id:"checking"},\n  creditor_account:{pix_key:"carol@…"}, instructed_amount:{currency:"BRL", amount:"800.00"}}
+
+== 2. Pre-authorization confirmation: MRTR round (UX only, never the authorization) ==
+
+RS --> C : **200** result **resultType:"input_required"** [id=2]\n  inputRequests.confirm = elicitation/create (form) "Pending payment op_X … continue?"\n  requestState = HMAC-sealed {op:"op_X"} (bound to sub, 10 min)
+C -> U : elicitation handler: [Y/n/c]
+alt user declines
+  U -> C : n
+  C -> RS : retry tools/call transfer [NEW id=3] + inputResponses{confirm:{proceed:false}} + requestState
+  T -> OPS : op_X = cancelled
+  RS --> C : 200 result "op_X cancelled, nothing executed" -> tool_result to the LLM
+else user proceeds
+  U -> C : y
+  C -> RS : retry tools/call transfer [NEW id=3, Bearer T1] + inputResponses{confirm:{proceed:true}} + requestState
+  RS -> RS : verify requestState (HMAC, expiry, sub) BEFORE the handler
+  T -> OPS : resolve by requestState -> op_X; awaiting_authorization
+end
+
+== 3. "Authorization required" for op_X (atomic: nothing committed) -- carried in the NEGOTIATED form ==
+
+T -> T : requireAuthorizationDetails(op_X, [detail]): T1 has no matching details; guard: nothing committed\nchooseBinding(server policy, client bindings)
+alt **http**: client declared nothing (or nothing in common); the interoperable default
+  T -> RS : record challenge (op_X); abort tool
+  RS --> C : **401** WWW-Authenticate: Bearer error="insufficient_authorization", error_description="…",\n  authorization_remediation=base64url({"authorization_details":[detail]}), resource_metadata="…"\nbody: application/problem+json -> JSON-RPC request id=3 is still UNANSWERED
+  note right of C : stepUpFetch HOLDS request id=3 (below the SDK)
+else **inband**: client declared bindings:["inband", …] (and always on stdio instead of http)
+  T -> RS : record challenge (op_X); abort tool
+  RS --> C : 200 JSON-RPC **error** [id=3] code **-32010** AUTHORIZATION_REQUIRED\n  data {error:"insufficient_authorization", error_description,\n        authorization_remediation:{authorization_details:[detail]}, resource_metadata, operation_id:"op_X"}
+  note right of C : the request IS answered (with an error);\ncall-tool.ts catches ProtocolError(-32010)
+else **mrtr**: client declared bindings:["mrtr", …]
+  T -> T : answer as a RESULT (no transport rewrite)
+  RS --> C : **200** result **resultType:"input_required"** [id=3]  (no inputRequests: MRTR has no input type for "obtain a token")\n  requestState = sealed {op:"op_X"}\n  _meta["lab.stepup/authorization_required"] = {same data as the -32010 error}
+  note right of C : the request IS answered, successfully: NOT an error.\ncall-tool.ts sees the _meta hint (manual MRTR mode)
+end
+
+== 4. Client remediation: ONE-SHOT token for op_X (identical for every binding) ==
+
+C -> C : decode remediation -> authorization_details (incl. instruction_id op_X)\nNO scope parameter; session token T1 is untouched
+C -> U : open /auth?authorization_details=[detail]&resource=…&code_challenge=…
+U -> UA : open URL
+UA -> AS : GET /auth (SSO session: no login)
+AS -> AS : validate money_transfer schema (instruction_id required)
+AS --> UA : consent "Approve this payment: R$ 800.00 · checking -> carol@… · Payment reference op_X"
+alt user denies
+  UA -> C : /callback?error=access_denied
+  C --> LLM : CallToolResult **isError** (synthesized by the client)\n"The user declined… nothing executed, do not retry"
+  note over T, OPS : op_X stays awaiting_authorization until TTL -> failed.\nNothing committed. T1 still valid.
+else user approves
+  UA -> C : /callback?code&iss
+  C -> AS : POST /token (code, code_verifier, resource)
+  AS --> C : **T2** JWT: no scope, authorization_details:[detail with instruction_id op_X], 120 s, no refresh
+
+  == 5. Retry with T2 (form depends on the binding), then claim atomically and commit once ==
+
+  alt **http**
+    C -> RS : **replay the SAME request** [id=3, same body incl. inputResponses + requestState, Bearer T2]
+  else **inband**
+    C -> RS : **NEW** tools/call transfer [id=4, _meta{"lab.stepup/operation_id":"op_X"}, Bearer T2]\n(stdio: T2 in _meta{"lab.stepup/access_token"}; there is no Authorization header)
+  else **mrtr**
+    C -> RS : **NEW** tools/call transfer [id=4] + the echoed requestState, Bearer T2\n(stepUpFetch attaches T2 only to the request echoing that requestState)
+  end
+  RS -> RS : verify T2; a one-shot token is accepted only on a payment tools/call (else 403 insufficient_scope)
+  RS -> T : dispatch
+  T -> OPS : resolve by **token instruction_id** -> op_X\ncheck sub, tool, argsHash; requestState / _meta / idempotency_key must not name another op
+  T -> OPS : **claim** (one synchronous step, before any side effect):\nop_X awaiting_authorization -> **executing**; jti(T2) -> spent on op_X
+  T -> T : re-validate balance; commit("transfer op_X") (the only side effect)
+  T -> OPS : op_X = completed + stored result
+  RS --> C : **200** resultType:"complete" "Transfer done (operation op_X)"
+  C -> C : discard T2
+  C --> LLM : tool_result (challenge, consent and retry are invisible to the LLM)
+end
+
+== 6. Later calls keep using the SESSION token ==
+
+LLM -> C : tool_use get_accounts
+C -> RS : tools/call get_accounts [Bearer **T1**]
+RS --> C : 200 balances (no login, no consent)
+
+== 7. Idempotency and binding ==
+
+group duplicate retry / spent token again
+  C -> RS : tools/call transfer [Bearer T2]
+  T -> OPS : resolve by T2 instruction_id -> op_X (completed)
+  RS --> C : 200 **stored result** (no re-execution, no new authorization)
+end
+group token presented on ANOTHER operation, or other parameters
+  C -> RS : tools/call transfer [requestState / _meta naming op_Y, Bearer T2]
+  RS --> C : 200 isError "token is bound to op_X, this request is op_Y. Nothing executed."
+  C -> RS : tools/call transfer {amount: 900} [Bearer T2]
+  RS --> C : 200 isError "request does not match op_X". Nothing executed.
+end
+group same idempotency_key on NEW requests
+  C -> RS : two new calls with idempotency_key K -> SAME op_Z (same instruction_id, one approval)
+  C -> RS : after op_Z completes: same K [Bearer T1] -> 200 stored result
+  C -> RS : same K, different amount -> isError "idempotency_key already used with different parameters"
+end
+group tampered or foreign requestState
+  C -> RS : tools/call + requestState modified, expired or minted for another user
+  RS --> C : JSON-RPC error -32602 "Invalid or expired requestState" (the handler never runs)
+end
+
+== 8. Guard: challenge after a side effect (non-atomic tool) ==
+
+LLM -> C : tool_use naive_batch_transfer{[R$ 20 -> new payee]}
+C -> RS : tools/call [Bearer T1]
+T -> T : register payee -> commit (committed[] not empty)
+T -> T : requireAuthorizationDetails -> **guard**: ChallengeAfterCommit (no 401 / -32010 / input_required)
+RS --> C : 200 isError "Partially executed: payee registered; no transfer executed"
+note over C, AS : With known payees nothing is committed first: one challenge carries N details\n(instruction_id op_B-1 … op_B-N), so one consent and one token cover the batch.
+
+legend bottom left
+  <b>Key properties</b>
+  • Tools never advertise the requirement; it is discovered during execution.
+  • One outcome, three carriers, negotiated per request (lab extension lab.stepup/rar-remediation):
+      http   401 insufficient_authorization: the JSON-RPC request is unanswered, the client replays the SAME request (default)
+      inband JSON-RPC error -32010: the request is answered, the client retries as a NEW call naming op_X in _meta
+      mrtr   resultType "input_required" + requestState + _meta hint: NOT an error, the client retries echoing requestState
+    Server policy: CHALLENGE_BINDING (negotiate | mrtr | http | inband). Client list: AGENT_BINDINGS.
+  • authorization_details carry instruction_id = the server's operation id: a grant authorizes ONE operation instance.
+  • Claim = executing + jti spent, atomically, before any side effect; completed operations return their stored result.
+  • Operation token: authorization_details only, NO scope, short TTL, no refresh. Session token (mcp:basic) is never replaced.
+  • A refusal is a tool result (isError), not a transport error. Elicitation is UX, never the authorization itself.
+  • Open gap: the AS cannot verify the RS issued the instruction_id (a server-signed remediation would close it).
+endlegend
+
+@enduml

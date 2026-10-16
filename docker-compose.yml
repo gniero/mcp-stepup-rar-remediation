@@ -31,8 +31,11 @@ services:
       OIDC_JWKS_URI: http://idp:8080/jwks
       BASE_SCOPE: mcp:basic
       PAYMENT_DETAILS_TYPE: money_transfer
-      # "http": 401 insufficient_authorization (RAR remediation draft) | "inband": JSON-RPC error -32043
-      CHALLENGE_BINDING: ${CHALLENGE_BINDING:-http}
+      # Server policy for "authorization required" (see mcp-server/src/challenge.ts):
+      # "negotiate": clients that declare the lab.stepup/rar-remediation extension pick an in-band
+      #              form (mrtr = input_required result, inband = JSON-RPC error -32010); others: 401
+      # "mrtr": negotiate, offering only mrtr | "http": always 401 | "inband": always -32010
+      CHALLENGE_BINDING: ${CHALLENGE_BINDING:-negotiate}
       ELICITATION_TIMEOUT_MS: "120000"
       DEMO_UNSAFE_TOOL: "true"
       RISK_AMOUNT_THRESHOLD: "500"
@@ -66,6 +69,8 @@ services:
       BACKCHANNEL_REWRITE: http://localhost:8080=http://idp:8080
       # LLM: "anthropic" (Claude, needs ANTHROPIC_API_KEY) or "openai" (any OpenAI-compatible server,
       # e.g. Ollama / LM Studio running natively on the host, where it can use the GPU)
+      # In-band forms the agent declares, in preference order ("" = none: the server answers 401)
+      AGENT_BINDINGS: ${AGENT_BINDINGS-mrtr,inband}
       LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
       LLM_MODEL: ${LLM_MODEL:-}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-http://host.docker.internal:11434/v1}

@@ -31,7 +31,13 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import type { AuthorizationDetail, Principal } from "./auth.ts";
 import { setStatus, type Operation } from "./operations.ts";
 
-export type Challenge = { authorizationDetails: AuthorizationDetail[]; reason: string; operationId?: string };
+export type Challenge = {
+  authorizationDetails: AuthorizationDetail[];
+  reason: string;
+  operationId?: string;
+  /** Transport form chosen for this request (see challenge.ts chooseBinding). Default "http". */
+  binding?: "http" | "inband";
+};
 type Ctx = { principal: Principal; challenge?: Challenge; committed: string[] };
 
 export const requestContext = new AsyncLocalStorage<Ctx>();
@@ -59,6 +65,9 @@ function ctx(): Ctx {
 
 /** The principal of the request being handled (validated token). */
 export const principal = (): Principal => ctx().principal;
+
+/** The tool answered the challenge itself (MRTR binding): the transport must not rewrite the response. */
+export const clearChallenge = () => void (ctx().challenge = undefined);
 
 /** Run a side effect and remember that this request is no longer "clean". */
 export function commit<T>(label: string, fn: () => T): T {

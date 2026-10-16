@@ -8,7 +8,14 @@ import {
 } from "@modelcontextprotocol/server";
 import { z } from "zod";
 import { config } from "./config.ts";
-import { ChallengeAfterCommit, commit, principal, requireAuthorizationDetails } from "./stepup.ts";
+import {
+  AuthorizationRequired,
+  ChallengeAfterCommit,
+  clearChallenge,
+  commit,
+  principal,
+  requireAuthorizationDetails,
+} from "./stepup.ts";
 import {
   createOperation,
   findById,
@@ -19,7 +26,14 @@ import {
   setStatus,
   type Operation,
 } from "./operations.ts";
-import { META_OPERATION_ID } from "./challenge.ts";
+import {
+  EXTENSION_ID,
+  META_AUTHORIZATION_REQUIRED,
+  META_OPERATION_ID,
+  OFFERED_BINDINGS,
+  authorizationRequiredData,
+  chooseBinding,
+} from "./challenge.ts";
 import { requestStateCodec, type OperationState } from "./request-state.ts";
 import type { AuthorizationDetail } from "./auth.ts";
 
@@ -53,8 +67,12 @@ const brl = (n: number) => `R$ ${n.toFixed(2)}`;
 export function buildServer(): McpServer {
   const server = new McpServer(
     { name: "stepup-lab-bank", version: "0.2.0" },
-    // MRTR: every echoed requestState is HMAC-verified (and user-bound) before a handler runs.
-    { requestState: { verify: requestStateCodec.verify } },
+    {
+      // MRTR: every echoed requestState is HMAC-verified (and user-bound) before a handler runs.
+      requestState: { verify: requestStateCodec.verify },
+      // Advertised on server/discover: the in-band forms this server offers (see challenge.ts).
+      ...(OFFERED_BINDINGS.length ? { capabilities: { extensions: { [EXTENSION_ID]: { bindings: OFFERED_BINDINGS } } } } : {}),
+    },
   );
 
   server.registerTool(
@@ -144,11 +162,8 @@ export function buildServer(): McpServer {
       }
 
       // ---- Authorization for THIS operation; claims it (executing) + spends the token ----
-      requireAuthorizationDetails(
-        op,
-        [op.checkpoint.detail],
-        `${config.paymentDetailsType} ${op.id}: ${op.summary}`,
-      );
+      const authStep = await authorizationStep(server, ctx, op, [op.checkpoint.detail], `${config.paymentDetailsType} ${op.id}: ${op.summary}`);
+      if (authStep) return authStep;
 
       // ---- Claimed: re-validate (state may have changed while the user was away), then commit
       const acct = l.accounts.find((a) => a.id === from_account)!;
@@ -185,7 +200,7 @@ export function buildServer(): McpServer {
           idempotency_key: z.string().min(8).optional(),
         }),
       },
-      async (args, ctx) => {
+      async (args, ctx): Promise<CallToolResult | InputRequiredResult> => {
         const { from_account, items } = args;
         const p = principal();
         const l = ledgerFor(p.sub);
@@ -218,7 +233,8 @@ export function buildServer(): McpServer {
           setStatus(op, "awaiting_authorization");
         }
         try {
-          requireAuthorizationDetails(op, op.checkpoint.details, `batch ${op.id} of ${items.length} transfers`);
+          const authStep = await authorizationStep(server, ctx, op, op.checkpoint.details, `batch ${op.id} of ${items.length} transfers`);
+          if (authStep) return authStep;
         } catch (e) {
           if (!(e instanceof ChallengeAfterCommit)) throw e; // nothing committed yet -> the challenge is honest
           const result = fail(
@@ -248,6 +264,41 @@ export function buildServer(): McpServer {
 }
 
 type Checkpoint = { detail: AuthorizationDetail; notes: string[] };
+
+/**
+ * Require the operation's authorization_details (see stepup.ts). When they are missing, the form of
+ * the answer is negotiated per request (challenge.ts chooseBinding):
+ *  - "mrtr": a NON-error MRTR step, `input_required` + sealed requestState {op} + remediation in _meta;
+ *  - "inband" / "http": rethrow with the chosen form recorded on the challenge, so the transport
+ *    answers with -32010 or 401 (stdio always uses -32010).
+ * Resolves to undefined when the token authorizes the operation (now claimed: executing).
+ */
+async function authorizationStep(
+  server: McpServer,
+  ctx: ServerContext,
+  op: Operation<unknown>,
+  required: AuthorizationDetail[],
+  reason: string,
+): Promise<InputRequiredResult | undefined> {
+  try {
+    requireAuthorizationDetails(op, required, reason);
+    return undefined;
+  } catch (e) {
+    if (!(e instanceof AuthorizationRequired)) throw e;
+    const { binding, why } = chooseBinding(server.server.getClientCapabilities());
+    console.log(`[op] ${op.id} authorization required -> binding ${binding} (${why})`);
+    if (binding !== "mrtr") {
+      e.challenge.binding = binding; // the transport layer answers with this form
+      throw e;
+    }
+    clearChallenge(); // answered here, as a result: no 401 / -32010 rewrite
+    return {
+      ...inputRequired({ requestState: await requestStateCodec.mint({ op: op.id }, ctx) }),
+      _meta: { [META_AUTHORIZATION_REQUIRED]: authorizationRequiredData(e.challenge) },
+    };
+  }
+}
+
 type BatchCheckpoint = { details: AuthorizationDetail[] };
 
 /**

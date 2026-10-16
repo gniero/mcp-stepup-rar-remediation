@@ -94,19 +94,26 @@ export class OAuthSession {
     this.callbackPort = callbackPort;
   }
 
-  /** One-shot token waiting for the in-band retry of a specific operation. */
-  private armed?: { token: string; operationId: string };
+  /**
+   * One-shot token waiting for the retry of a specific operation: the in-band retry names the
+   * operation in _meta; the MRTR retry echoes the requestState the authorization step came with.
+   */
+  private armed?: { token: string; operationId?: string; requestState?: string };
 
-  armOneShot(token: string, operationId: string) {
-    this.armed = { token, operationId };
+  armOneShot(token: string, match: { operationId?: string; requestState?: string }) {
+    this.armed = { token, ...match };
   }
 
-  /** Hand out the armed token once, only to the request that names its operation. */
-  takeArmedOneShot(operationId: string | undefined): string | undefined {
-    if (!this.armed || !operationId || this.armed.operationId !== operationId) return undefined;
-    const t = this.armed.token;
+  /** Hand out the armed token once, only to the JSON-RPC request it was obtained for. */
+  takeArmedOneShot(body: any): string | undefined {
+    const a = this.armed;
+    if (!a || body?.method !== "tools/call") return undefined;
+    const matches =
+      (a.operationId !== undefined && body.params?._meta?.["lab.stepup/operation_id"] === a.operationId) ||
+      (a.requestState !== undefined && body.params?.requestState === a.requestState);
+    if (!matches) return undefined;
     this.armed = undefined;
-    return t;
+    return a.token;
   }
 
   /** The session token (baseline scope). Never replaced by a one-shot token. */
