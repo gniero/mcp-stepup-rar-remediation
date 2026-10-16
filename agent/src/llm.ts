@@ -7,7 +7,7 @@
  *                            Ollama, LM Studio, llama.cpp server, vLLM, ... (OPENAI_BASE_URL)
  */
 import Anthropic from "@anthropic-ai/sdk";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
+import type { Tool } from "@modelcontextprotocol/client";
 import { log } from "./log.ts";
 
 export type ToolOutcome = { text: string; isError: boolean };

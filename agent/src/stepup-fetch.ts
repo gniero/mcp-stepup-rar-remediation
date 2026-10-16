@@ -3,8 +3,8 @@
  *
  * Any MCP HTTP request (initialize, tools/call, ...) that comes back with a Bearer challenge
  * is *held*: the wrapper runs the OAuth flow the challenge asks for, then replays the very
- * same HTTP request (same JSON-RPC id, same Mcp-Session-Id). The MCP layer and the LLM only
- * ever see the final response.
+ * same HTTP request (same JSON-RPC id, same body, including any MRTR `requestState` /
+ * `inputResponses`). The MCP layer and the LLM only ever see the final response.
  *
  *  - 401 (no error / invalid_token) or 403 insufficient_scope
  *      -> (re)obtain the SESSION token, replay, keep using it afterwards.
@@ -17,11 +17,11 @@
  * synthesized CallToolResult { isError: true } instead of surfacing a transport error: for the
  * model, "the user said no" is a tool outcome, not a protocol failure, and must not invite a retry.
  *
- * In-band binding (JSON-RPC error -32043, see inband.ts): the retry is a new request that names
+ * In-band binding (JSON-RPC error -32010, see inband.ts): the retry is a new request that names
  * the operation in _meta; `oauth.armOneShot()` makes this wrapper attach the one-shot token to
  * exactly that request.
  */
-import type { FetchLike } from "@modelcontextprotocol/sdk/shared/transport.js";
+import type { FetchLike } from "@modelcontextprotocol/client";
 import { AuthorizationDenied, parseBearerChallenge, type OAuthSession } from "./oauth.ts";
 import { log } from "./log.ts";
 
@@ -45,6 +45,7 @@ function declinedToolResult(init: RequestInit | undefined, reason: string): Resp
     result: {
       content: [{ type: "text", text: `${reason} Nothing was executed. Do not retry unless the user asks again.` }],
       isError: true,
+      resultType: "complete",
       _meta: { "lab.stepup/authorization": "declined" },
     },
   };
@@ -56,9 +57,9 @@ function label(init?: RequestInit): string {
   try {
     const m = JSON.parse(String(init?.body));
     if (m.method === "tools/call") return `tools/call:${m.params.name}#${m.id}`;
-    return m.method ?? `response#${m.id} (to a server request, e.g. elicitation)`;
+    return m.method ?? `message#${m.id}`;
   } catch {
-    return init?.method === "DELETE" ? "session" : "sse-stream";
+    return init?.method ?? "?";
   }
 }
 

@@ -1,7 +1,7 @@
 @startuml stepup-http
 ' MCP mid-interaction per-operation authorization with RAR remediation
 ' (RFC 9396 + draft-ietf-oauth-rar-metadata-remediation), matching mcp-stepup-lab:
-' TS SDK 1.32, node-oidc-provider 9.12, operation binding via instruction_id
+' MCP 2026-07-28 (stateless, MRTR), TS SDK v2, node-oidc-provider 9.12, operation binding via instruction_id
 
 !theme plain
 skinparam shadowing false
@@ -17,7 +17,7 @@ skinparam sequenceGroupBorderColor #666666
 skinparam sequenceDividerBackgroundColor #EEF2F7
 autonumber "<b>[00]"
 
-title [HTTP binding] MCP mid-interaction authorization over Streamable HTTP\n401 insufficient_authorization + RAR remediation, one-shot token bound to ONE operation (CHALLENGE_BINDING=http, default)
+title [HTTP binding] MCP 2026-07-28 mid-interaction authorization over stateless Streamable HTTP\n401 insufficient_authorization + RAR remediation, one-shot token bound to ONE operation (CHALLENGE_BINDING=http, default)
 
 actor "User" as U
 participant "User Agent\n(browser)" as UA
@@ -37,7 +37,7 @@ participant "AS\n(node-oidc-provider,\nRAR enabled)" as AS
 
 == 0. Bootstrap: SESSION token (scope=mcp:basic) ==
 
-C -> RS : POST /mcp initialize (no Authorization)
+C -> RS : POST /mcp server/discover (no Authorization)\nMCP-Protocol-Version: 2026-07-28, Mcp-Method: server/discover
 RS --> C : **401** WWW-Authenticate: Bearer scope="mcp:basic", resource_metadata="…/oauth-protected-resource/mcp"\nbody: application/problem+json (not a JSON-RPC response)
 C -> RS : GET PRM (RFC 9728)
 RS --> C : {resource, authorization_servers:[iss], scopes_supported:["mcp:basic"]}
@@ -47,48 +47,50 @@ C -> U : open /auth?scope=mcp:basic&resource=…&code_challenge=…
 U -> UA : open URL
 UA -> AS : login (alice) + consent "Read your accounts and balances"
 AS --> UA : 302 redirect_uri?code
-UA -> C : GET /callback?code&state
+UA -> C : GET /callback?code&state&**iss**
+C -> C : RFC 9207: iss == AS issuer (MUST in MCP 2026-07-28)
 C -> AS : POST /token (code, code_verifier, resource)
 AS --> C : **T1** JWT (aud=MCP resource, scope="mcp:basic", 600 s)
 C -> C : store T1 as the SESSION token
-C -> RS : replay initialize (Bearer T1)
-RS --> C : 200 + Mcp-Session-Id: S (bound to sub)
-C -> RS : GET /mcp (standalone SSE stream, carries the elicitation later)
+C -> RS : replay server/discover (Bearer T1)
+RS --> C : 200 {supportedVersions:["2026-07-28"], capabilities}\nno session: every later request is self-contained\n(_meta: protocolVersion, clientInfo, clientCapabilities{elicitation})
 
 == 1. Transfer: the tool discovers it needs a per-operation grant ==
 
 U -> LLM : "send R$ 800 to carol@pix.example from checking"
 LLM -> C : tool_use transfer{from_account, pix_key, amount [, idempotency_key]}
-C -> RS : POST tools/call transfer [JSON-RPC id=7, session S, Bearer T1]
-RS -> T : dispatch (JSON response mode: no status line yet)
-T -> OPS : resolve operation: token instruction_id? idempotency_key? (S, 7)?
+C -> RS : POST tools/call transfer [JSON-RPC id=2, Bearer T1]\nMcp-Method: tools/call, Mcp-Name: transfer
+RS -> T : dispatch to a per-request server (JSON response mode: no status line yet)
+T -> OPS : resolve operation: token instruction_id? requestState? idempotency_key?
 OPS --> T : none
 T -> T : validate account + balance (read-only)
 T -> OPS : createOperation -> **op_X** (status awaiting_confirmation)\ncheckpoint.detail = {type:"money_transfer", **instruction_id:"op_X"**,\n  debtor_account:{account_id:"checking"}, creditor_account:{pix_key:"carol@…"},\n  instructed_amount:{currency:"BRL", amount:"800.00"}}
 
-== 2. Pre-authorization elicitation (UX only) ==
+== 2. Pre-authorization confirmation: MRTR round (UX only, not an error) ==
 
-T -> RS : elicitation/create (form, unrelated -> standalone GET stream)
-RS -->> C : "Pending payment op_X: R$ 800.00 checking -> carol… continue?"
-C -> U : terminal prompt [Y/n/c]
+T -> T : requestState = HMAC-seal({op:"op_X"}), bound to sub, 10 min
+RS --> C : **200** result **resultType:"input_required"** [id=2]\n  inputRequests.confirm = elicitation/create (form) "Pending payment op_X: R$ 800.00 checking -> carol… continue?"\n  requestState = "v1.…"
+C -> U : SDK MRTR driver -> elicitation handler: terminal prompt [Y/n/c]
 alt user declines
   U -> C : n
-  C -> RS : JSON-RPC result {proceed:false} -> 202
-  T -> OPS : op_X = cancelled
-  RS --> C : **200** result "op_X cancelled, nothing executed" [id=7]
+  C -> RS : retry tools/call transfer [NEW id=3, Bearer T1] + inputResponses{confirm: accept {proceed:false}} + requestState
+  RS -> RS : verify requestState (HMAC, expiry, sub) before the handler
+  T -> OPS : resolve by requestState -> op_X; op_X = cancelled
+  RS --> C : **200** result "op_X cancelled, nothing executed" [id=3]
   C --> LLM : tool_result
 else user proceeds
   U -> C : y
-  C -> RS : JSON-RPC result {proceed:true} -> 202
-  T -> OPS : op_X = awaiting_authorization
+  C -> RS : retry tools/call transfer [NEW id=3, Bearer T1] + inputResponses{confirm: accept {proceed:true}} + requestState
+  RS -> RS : verify requestState (HMAC, expiry, sub) before the handler
+  T -> OPS : resolve by requestState -> op_X; op_X = awaiting_authorization
 end
 
 == 3. Challenge: "authorization required" for op_X (atomic: nothing committed) ==
 
 T -> T : requireAuthorizationDetails(op_X, [detail])\nT1 has no matching details -> not granted; guard: committed[] empty
 T -> RS : record challenge (operation op_X); abort tool
-RS --> C : **401** WWW-Authenticate: Bearer error="insufficient_authorization",\n  error_description="…", authorization_remediation=base64url({"authorization_details":[detail]}),\n  resource_metadata="…"   (no authorization_reference: single-use)\nbody: application/problem+json -> JSON-RPC request id=7 is still UNANSWERED
-note right of C : stepUpFetch HOLDS request id=7; the LLM and the MCP SDK see nothing yet
+RS --> C : **401** WWW-Authenticate: Bearer error="insufficient_authorization",\n  error_description="…", authorization_remediation=base64url({"authorization_details":[detail]}),\n  resource_metadata="…"   (no authorization_reference: single-use)\nbody: application/problem+json -> JSON-RPC request id=3 is still UNANSWERED
+note right of C : stepUpFetch HOLDS request id=3; the LLM and the MCP SDK see nothing yet.\nMRTR has no input type for "get a token", so this step stays a transport-level challenge.
 
 == 4. Client remediation: ONE-SHOT token for op_X ==
 
@@ -100,7 +102,7 @@ AS -> AS : validate money_transfer schema (instruction_id required)
 AS --> UA : consent "Approve this payment: R$ 800.00 · checking -> carol@… · Payment reference op_X"
 alt user denies
   UA -> C : /callback?error=access_denied
-  C --> LLM : stepUpFetch answers id=7 locally: CallToolResult **isError**\n"The user declined… nothing executed, do not retry"
+  C --> LLM : stepUpFetch answers id=3 locally: CallToolResult **isError**\n"The user declined… nothing executed, do not retry"
   note over T, OPS : op_X stays awaiting_authorization until TTL -> failed.\nNothing committed. T1 still valid.
 else user approves
   UA -> C : /callback?code
@@ -109,10 +111,10 @@ else user approves
 
   == 5. Retry with T2: resolve by token, claim atomically, commit once ==
 
-  C -> RS : **replay SAME request** [id=7, session S, same body, Bearer T2]
-  RS -> RS : verify T2; one-shot token -> only accepted on a payment tools/call; sub == session sub
+  C -> RS : **replay SAME request** [id=3, same body incl. inputResponses + requestState, Bearer T2]
+  RS -> RS : verify T2; one-shot token -> only accepted on a payment tools/call; requestState bound to the same sub
   RS -> T : dispatch
-  T -> OPS : resolve by **token instruction_id** -> op_X\ncheck sub, tool, argsHash; this request must not belong to another op
+  T -> OPS : resolve by **token instruction_id** -> op_X\ncheck sub, tool, argsHash; requestState / _meta / idempotency_key must not name another op
   T -> T : requireAuthorizationDetails(op_X): T2 details == detail (incl. instruction_id)
   T -> OPS : **claim** (one synchronous step, before any side effect):\nop_X awaiting_authorization -> **executing**; jti(T2) -> spent on op_X
   T -> T : re-validate balance; commit("transfer op_X") (only side effect)
@@ -131,15 +133,17 @@ RS --> C : 200 balances (no login, no consent)
 == 7. Idempotency and binding ==
 
 group duplicate replay / spent token again
-  C -> RS : tools/call transfer [id=7 or new id, Bearer T2]
+  C -> RS : tools/call transfer [id=3 or new id, Bearer T2]
   T -> OPS : resolve by T2 instruction_id -> op_X (completed)
   RS --> C : 200 **stored result** (no re-execution, no new authorization)
 end
-group token presented on ANOTHER operation with identical values
-  note over C, RS : request id=9 is a second identical transfer -> its own op_Y (instruction_id op_Y)
-  C -> RS : tools/call transfer [id=9, Bearer T2]
+group token presented on ANOTHER operation
+  note over C, RS : a second identical transfer -> its own op_Y (instruction_id op_Y)
+  C -> RS : tools/call transfer [requestState / _meta naming op_Y, Bearer T2]
   T -> OPS : token says op_X, request belongs to op_Y
   RS --> C : 200 isError "token is bound to op_X, this request is op_Y. Nothing executed."
+  C -> RS : tools/call transfer {amount: 900} [Bearer T2]
+  RS --> C : 200 isError "request does not match op_X". Nothing executed.
 end
 group same idempotency_key on NEW requests
   C -> RS : tools/call transfer {…, idempotency_key K} [id=20] -> challenge for op_Z
@@ -164,8 +168,10 @@ note over C, AS : With known payees nothing is committed first: one challenge ca
 legend bottom left
   <b>Key properties</b>
   • Tools never advertise the requirement; it is discovered during execution.
-  • HTTP binding: 401 insufficient_authorization leaves the JSON-RPC request unanswered, so the client replays the SAME id.
+  • HTTP binding: 401 insufficient_authorization leaves the JSON-RPC request unanswered, so the client replays the SAME request.
     The in-band (stream) binding is in stepup-stream.puml.
+  • MCP 2026-07-28: no sessions; the confirmation is an MRTR input_required round (a result, not an error),
+    and the sealed, user-bound requestState carries op_X across rounds.
   • authorization_details carry instruction_id = the server's operation id: a grant authorizes ONE operation instance.
   • Claim = executing + jti spent, atomically, before any side effect; completed operations return their stored result.
   • Operation token: authorization_details only, NO scope, short TTL, no refresh. Session token (mcp:basic) is never replaced.

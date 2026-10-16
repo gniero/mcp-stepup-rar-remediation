@@ -7,9 +7,11 @@
  *
  * Lookup order when a call arrives (first match wins):
  *   1. the operation named by the token's authorization_details.instruction_id  (authoritative)
- *   2. `_meta["lab.stepup/operation_id"]`  (in-band retry before the token is presented)
- *   3. (sub, tool, idempotency_key)        (business-level dedupe across NEW requests)
- *   4. (MCP session, JSON-RPC request id)  (HTTP-level replay of the same request)
+ *   2. the MRTR `requestState` (HMAC-sealed {op}) echoed on a multi-round-trip retry
+ *   3. `_meta["lab.stepup/operation_id"]`  (in-band retry after -32010 AUTHORIZATION_REQUIRED)
+ *   4. (sub, tool, idempotency_key)        (business-level dedupe across NEW requests)
+ * There is no (session, request id) key any more: MCP 2026-07-28 has no sessions, and every
+ * retry is a new JSON-RPC request with a new id.
  *
  * Lifecycle (one-way):
  *   awaiting_confirmation -> awaiting_authorization -> executing -> completed | failed
@@ -19,7 +21,7 @@
  * Completed operations keep their result: any later retry returns it (idempotency).
  */
 import { createHash, randomBytes } from "node:crypto";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
+import type { CallToolResult } from "@modelcontextprotocol/server";
 
 export type OpStatus =
   | "awaiting_confirmation"
@@ -33,7 +35,6 @@ export type Operation<C = unknown> = {
   id: string;
   sub: string;
   clientId: string;
-  requestKey: string;
   tool: string;
   argsHash: string;
   idempotencyKey?: string;
@@ -50,10 +51,8 @@ export type Operation<C = unknown> = {
 /** Operation lifetime. Must be >= the one-shot token TTL so a valid token never meets an expired operation. */
 const TTL_MS = 10 * 60_000;
 const byId = new Map<string, Operation>();
-const byRequest = new Map<string, string>();
 const byIdempotencyKey = new Map<string, string>();
 
-export const requestKey = (sessionId: string | undefined, requestId: string | number) => `${sessionId ?? "-"}:${requestId}`;
 const idemKey = (sub: string, tool: string, key: string) => `${sub}\u0000${tool}\u0000${key}`;
 
 export function hashArgs(args: unknown): string {
@@ -71,7 +70,6 @@ export function findById(id: string | undefined): Operation | undefined {
   }
   return op;
 }
-export const findByRequest = (key: string) => findById(byRequest.get(key));
 export const findByIdempotencyKey = (sub: string, tool: string, key: string) =>
   findById(byIdempotencyKey.get(idemKey(sub, tool, key)));
 
@@ -92,7 +90,6 @@ export function createOperation<C>(
     expiresAt: Date.now() + TTL_MS,
   };
   byId.set(id, op);
-  byRequest.set(o.requestKey, id);
   if (o.idempotencyKey) byIdempotencyKey.set(idemKey(o.sub, o.tool, o.idempotencyKey), id);
   return op;
 }

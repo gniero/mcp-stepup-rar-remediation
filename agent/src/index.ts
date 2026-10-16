@@ -7,8 +7,7 @@
  *   node src/index.ts "some prompt"   one-shot
  */
 import readline from "node:readline/promises";
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { Client, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { OAuthSession } from "./oauth.ts";
 import { stepUpFetch } from "./stepup-fetch.ts";
 import { log } from "./log.ts";
@@ -29,15 +28,23 @@ const oauth = new OAuthSession(
 );
 
 // ---- MCP connection ---------------------------------------------------------
-log.tool("stepup-lab agent: session token (mcp:basic) + RAR remediation client (one-shot authorization_details tokens)");
+log.tool("stepup-lab agent (MCP 2026-07-28): session token (mcp:basic) + RAR remediation client (one-shot authorization_details tokens)");
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 const mcp = new Client(
-  { name: "stepup-lab-agent", version: "0.1.0" },
-  { capabilities: { elicitation: { form: {} } } },
+  { name: "stepup-lab-agent", version: "0.2.0" },
+  {
+    capabilities: { elicitation: { form: {} } },
+    // MCP 2026-07-28 only (the lab server rejects 2025-era traffic): server/discover instead of
+    // initialize, no session, the _meta envelope on every request.
+    versionNegotiation: { mode: { pin: "2026-07-28" } },
+    // MRTR: input_required rounds (the pre-authorization confirmation) are answered by the
+    // elicitation handler below and retried automatically inside callTool().
+    inputRequired: { autoFulfill: true, maxRounds: 4 },
+  },
 );
 registerElicitation(mcp, (q) => rl.question(q));
 const transport = new StreamableHTTPClientTransport(new URL(MCP_URL), { fetch: stepUpFetch(oauth) });
-await mcp.connect(transport, { timeout: HELD_REQUEST_TIMEOUT_MS }); // first request gets 401 -> login -> replay
+await mcp.connect(transport, { timeout: HELD_REQUEST_TIMEOUT_MS }); // server/discover gets 401 -> login -> replay
 const { tools } = await mcp.listTools(undefined, { timeout: HELD_REQUEST_TIMEOUT_MS });
 log.tool(`connected to ${MCP_URL}; tools: ${tools.map((t) => t.name).join(", ")}`);
 
@@ -45,7 +52,7 @@ log.tool(`connected to ${MCP_URL}; tools: ${tools.map((t) => t.name).join(", ")}
 async function callTool(name: string, args: Record<string, unknown>): Promise<ToolOutcome> {
   log.tool(`${name} ${JSON.stringify(args)}`);
   try {
-    // HTTP binding (401) is handled inside stepUpFetch; in-band binding (-32043) here.
+    // HTTP binding (401) is handled inside stepUpFetch; in-band binding (-32010) here.
     const r = await callToolWithAuthorization(mcp, oauth, { name, arguments: args }, { timeout: HELD_REQUEST_TIMEOUT_MS });
     const text = (r.content as any[]).map((c) => (c.type === "text" ? c.text : JSON.stringify(c))).join("\n");
     log.tool(`result${r.isError ? " (error)" : ""}: ${text.split("\n")[0]}`);

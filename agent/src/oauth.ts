@@ -64,6 +64,7 @@ const backchannel = (url: string) => rewrites.reduce((u, [from, to]) => (u.start
 
 type AsMetadata = {
   issuer: string;
+  authorization_response_iss_parameter_supported?: boolean;
   authorization_endpoint: string;
   token_endpoint: string;
   authorization_details_types_supported?: string[];
@@ -203,7 +204,11 @@ export class OAuthSession {
     }).toString();
     log.prompt(`Open this URL in your browser to continue:\n\n   ${authUrl}\n`);
 
-    const code = await this.waitForCallback(state);
+    const { code, iss } = await this.waitForCallback(state);
+    // RFC 9207 (MCP 2026-07-28: clients MUST validate a present `iss` before redeeming the code;
+    // an AS that advertises support must send it). Defends against AS mix-up.
+    if (iss !== undefined ? iss !== this.asMeta!.issuer : this.asMeta!.authorization_response_iss_parameter_supported)
+      throw new Error(`authorization response issuer mismatch: got ${iss ?? "(none)"}, expected ${this.asMeta!.issuer}`);
 
     const tokenRes = await fetch(backchannel(this.asMeta!.token_endpoint), {
       method: "POST",
@@ -224,9 +229,9 @@ export class OAuthSession {
 
   /** One long-lived redirect_uri listener; pending authorizations are keyed by `state`. */
   private callbackServer?: Server;
-  private pending = new Map<string, { resolve: (code: string) => void; reject: (e: Error) => void }>();
+  private pending = new Map<string, { resolve: (r: { code: string; iss?: string }) => void; reject: (e: Error) => void }>();
 
-  private waitForCallback(state: string): Promise<string> {
+  private waitForCallback(state: string): Promise<{ code: string; iss?: string }> {
     this.callbackServer ??= createServer((req, res) => {
       const u = new URL(req.url ?? "/", this.redirectUri);
       if (u.pathname !== new URL(this.redirectUri).pathname) return void res.writeHead(404).end();
@@ -241,7 +246,7 @@ export class OAuthSession {
         return p.reject(new AuthorizationDenied(`${err}: ${u.searchParams.get("error_description") ?? ""}`));
       }
       reply("Authorized. Back to the agent.");
-      p.resolve(u.searchParams.get("code")!);
+      p.resolve({ code: u.searchParams.get("code")!, iss: u.searchParams.get("iss") ?? undefined });
     }).listen(this.callbackPort, "0.0.0.0");
     this.callbackServer.unref();
     return new Promise((resolve, reject) => this.pending.set(state, { resolve, reject }));

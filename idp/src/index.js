@@ -66,6 +66,9 @@ const configuration = {
   interactions: { url: (_ctx, interaction) => `/interaction/${interaction.uid}` },
   features: {
     devInteractions: { enabled: false },
+    // RFC 9207 `iss` in authorization responses is always on in oidc-provider v9 (discovery:
+    // authorization_response_iss_parameter_supported=true). MCP 2026-07-28: AS SHOULD send it,
+    // clients MUST check it.
     resourceIndicators: {
       enabled: true,
       defaultResource: () => MCP_RESOURCE,

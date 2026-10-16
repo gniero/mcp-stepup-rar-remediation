@@ -1,19 +1,28 @@
+/**
+ * MCP 2026-07-28 over Streamable HTTP: stateless (no initialize, no Mcp-Session-Id). Every POST is
+ * a self-contained request: authenticate the bearer token, run the request through a per-request
+ * McpServer (createMcpHandler), and, if a tool discovered it needs authorization for an operation,
+ * replace the response with the binding's challenge.
+ */
 import { createServer } from "node:http";
-import { randomUUID } from "node:crypto";
 import { getRequestListener } from "@hono/node-server";
-import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
-import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+import { createMcpHandler } from "@modelcontextprotocol/server";
 import { config, prmPath } from "./config.ts";
 import { AuthError, authenticate, bearerChallenge, insufficientAuthorizationChallenge, protectedResourceMetadata } from "./auth.ts";
 import { newRequestContext, requestContext } from "./stepup.ts";
 import { buildServer } from "./tools.ts";
-import { PAYMENT_TOOLS, bindInband } from "./challenge.ts";
+import { PAYMENT_TOOLS, inbandHttpResponse } from "./challenge.ts";
 
-type Session = { transport: WebStandardStreamableHTTPServerTransport; sub: string };
-const sessions = new Map<string, Session>();
-
-const json = (status: number, body: unknown, headers: Record<string, string> = {}) =>
-  new Response(JSON.stringify(body), { status, headers: { "content-type": "application/json", ...headers } });
+const mcp = createMcpHandler(() => buildServer(), {
+  // JSON mode: the status line is written only after the tool finishes,
+  // so a tool can still turn the response into a 401 challenge.
+  responseMode: "json",
+  // Modern-only: 2025-era requests (initialize, no _meta envelope) get UnsupportedProtocolVersion.
+  // The SDK's legacy stateless leg answers over SSE, which commits a 200 before the tool runs and
+  // so could not carry the mid-tool 401 this lab is about.
+  legacy: "reject",
+  onerror: (e) => console.log(`[mcp] ${e.message}`),
+});
 
 /**
  * RFC 9457 problem details for HTTP-level auth failures. Deliberately NOT a JSON-RPC response:
@@ -32,12 +41,6 @@ const problem = (status: 401 | 403, title: string, detail: string, extra: Record
     }),
     { status, headers: { "content-type": "application/problem+json", ...headers } },
   );
-
-const rpcError = (id: unknown, code: number, message: string, data?: unknown) => ({
-  jsonrpc: "2.0",
-  id: id ?? null,
-  error: { code, message, ...(data ? { data } : {}) },
-});
 
 function describe(body: unknown): string {
   const msgs = Array.isArray(body) ? body : body ? [body] : [];
@@ -59,11 +62,7 @@ async function handleMcp(req: Request): Promise<Response> {
     throw e;
   }
 
-  const body = req.method === "POST" ? await req.json().catch(() => undefined) : undefined;
-  const sessionId = req.headers.get("mcp-session-id");
-  let session = sessionId ? sessions.get(sessionId) : undefined;
-
-  if (sessionId && !session) return json(404, rpcError(null, -32001, "Session not found"));
+  const body = req.method === "POST" ? await req.clone().json().catch(() => undefined) : undefined;
 
   // A one-shot operation token (authorization_details only, no baseline scope) is good for
   // exactly one thing: the tool call that executes the operation it authorizes.
@@ -79,46 +78,18 @@ async function handleMcp(req: Request): Promise<Response> {
     }
   }
 
-  // A stepped-up token must belong to the same user that opened the session.
-  if (session && session.sub !== principal.sub) {
-    return problem(401, "invalid_token", "token subject does not match session", {}, {
-      "www-authenticate": bearerChallenge({ error: "invalid_token", description: "subject mismatch for session" }),
-    });
+  // ---- 2. Dispatch, with a per-request context (principal + challenge slot) the tools use ----
+  const ctx = newRequestContext(principal);
+  let res = await requestContext.run(ctx, () => mcp.fetch(req, { authInfo: principal, parsedBody: body }));
+
+  // ---- 3a. In-band binding: the JSON-RPC result becomes AUTHORIZATION_REQUIRED (-32010), still 200
+  if (ctx.challenge && config.challengeBinding === "inband") {
+    console.log(`[http] POST /mcp ${describe(body)} -> 200 AUTHORIZATION_REQUIRED in-band (${ctx.challenge.reason})`);
+    return inbandHttpResponse(res, ctx.challenge);
   }
 
-  // ---- 2. New session on initialize --------------------------------------
-  if (!session) {
-    if (req.method !== "POST" || !isInitializeRequest(body)) {
-      return json(400, rpcError(null, -32000, "Bad Request: no valid session ID"));
-    }
-    const sub = principal.sub;
-    const transport: WebStandardStreamableHTTPServerTransport = new WebStandardStreamableHTTPServerTransport({
-      sessionIdGenerator: () => randomUUID(),
-      // JSON mode: status line is written only after the tool finishes,
-      // so a tool can still turn the response into a 401 challenge.
-      enableJsonResponse: true,
-      onsessioninitialized: (id) => {
-        sessions.set(id, { transport, sub });
-        console.log(`[session] ${id} opened for sub=${sub} (${principal.username ?? "?"})`);
-      },
-    });
-    transport.onclose = () => {
-      if (transport.sessionId) sessions.delete(transport.sessionId);
-    };
-    await buildServer().connect(transport);
-    // In-band binding: challenges become AUTHORIZATION_REQUIRED JSON-RPC errors inside a 200.
-    if (config.challengeBinding === "inband") bindInband(transport);
-    session = { transport, sub };
-  }
-
-  // ---- 3. Dispatch, with a per-request context the tools can write to ------
-  const ctx = newRequestContext();
-  const res = await requestContext.run(ctx, () =>
-    session.transport.handleRequest(req, { authInfo: principal, parsedBody: body }),
-  );
-
-  // ---- 4. Tool needs authorization for this operation: replace the JSON-RPC result with
-  //         401 insufficient_authorization + authorization_remediation (RAR remediation draft)
+  // ---- 3b. HTTP binding: replace the JSON-RPC result with
+  //          401 insufficient_authorization + authorization_remediation (RAR remediation draft)
   if (ctx.challenge) {
     const { header, remediation } = insufficientAuthorizationChallenge(
       ctx.challenge.authorizationDetails,
@@ -139,9 +110,17 @@ async function handleMcp(req: Request): Promise<Response> {
     );
   }
 
+  if (res.status >= 400) res = await logged(res);
   const who = principal.oneShot ? `one-shot token ${principal.jti}` : `scopes=[${principal.scopes.join(" ")}]`;
   console.log(`[http] ${req.method} /mcp ${describe(body)} -> ${res.status} ${who}`);
   return res;
+}
+
+/** Surface SDK-level rejections (bad headers, unsupported version, ...) in the server log. */
+async function logged(res: Response): Promise<Response> {
+  const text = await res.text();
+  console.log(`[http] ${res.status} ${text.slice(0, 300)}`);
+  return new Response(text, { status: res.status, headers: res.headers });
 }
 
 const mcpListener = getRequestListener(handleMcp);

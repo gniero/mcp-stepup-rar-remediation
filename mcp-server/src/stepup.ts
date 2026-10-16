@@ -4,7 +4,8 @@
  * A tool handler runs, does its read-only business logic and only *then* finds out the
  * current token does not authorize the operation. It calls `requireAuthorizationDetails()`,
  * which records a challenge in the per-HTTP-request AsyncLocalStorage and aborts the handler.
- * The HTTP layer (index.ts) replaces the JSON-RPC response with
+ * The transport layer then replaces the JSON-RPC response with the binding's form of
+ * "authorization required" (see challenge.ts), e.g. for the HTTP binding:
  *
  *   HTTP/1.1 401 Unauthorized
  *   WWW-Authenticate: Bearer error="insufficient_authorization", error_description="...",
@@ -20,22 +21,21 @@
  * (`instruction_id`), and the token's jti is consumed atomically when the operation is claimed for
  * execution, so a token executes exactly one operation, exactly once.
  *
- * Needs JSON response mode (enableJsonResponse): with SSE the 200 status line is on the wire
- * before the tool runs.
+ * Needs JSON response mode (createMcpHandler responseMode: "json"): with SSE the 200 status line
+ * is on the wire before the tool runs.
+ *
+ * The per-request context also carries the authenticated principal, so tools read it the same
+ * way over HTTP (bearer header) and stdio (environment token or `_meta` one-shot token).
  */
 import { AsyncLocalStorage } from "node:async_hooks";
-import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import type { ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { AuthorizationDetail, Principal } from "./auth.ts";
 import { setStatus, type Operation } from "./operations.ts";
 
 export type Challenge = { authorizationDetails: AuthorizationDetail[]; reason: string; operationId?: string };
-type Ctx = { challenge?: Challenge; committed: string[] };
+type Ctx = { principal: Principal; challenge?: Challenge; committed: string[] };
 
 export const requestContext = new AsyncLocalStorage<Ctx>();
-export const newRequestContext = (): Ctx => ({ committed: [] });
-
-export type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+export const newRequestContext = (principal: Principal): Ctx => ({ principal, committed: [] });
 
 export class AuthorizationRequired extends Error {
   challenge: Challenge;
@@ -53,9 +53,12 @@ const consumedTokens = new Map<string, string>();
 
 function ctx(): Ctx {
   const c = requestContext.getStore();
-  if (!c) throw new Error("called outside an HTTP request context");
+  if (!c) throw new Error("called outside a request context");
   return c;
 }
+
+/** The principal of the request being handled (validated token). */
+export const principal = (): Principal => ctx().principal;
 
 /** Run a side effect and remember that this request is no longer "clean". */
 export function commit<T>(label: string, fn: () => T): T {
@@ -81,15 +84,10 @@ export const sameDetail = (a: unknown, b: unknown) => JSON.stringify(canon(a)) =
  * of any `await` between here and the commit.
  *
  * Otherwise abort the tool and make the transport answer "authorization required" with a
- * remediation for exactly this operation (401 insufficient_authorization, or -32043 in-band).
+ * remediation for exactly this operation (401 insufficient_authorization, or -32010 in-band).
  */
-export function requireAuthorizationDetails(
-  extra: Extra,
-  op: Operation<unknown>,
-  required: AuthorizationDetail[],
-  reason: string,
-): void {
-  const p = extra.authInfo as Principal;
+export function requireAuthorizationDetails(op: Operation<unknown>, required: AuthorizationDetail[], reason: string): void {
+  const p = principal();
   const granted = required.every((r) => p.authorizationDetails?.some((d) => sameDetail(d, r)) ?? false);
   const spentOn = p.jti ? consumedTokens.get(p.jti) : undefined;
 

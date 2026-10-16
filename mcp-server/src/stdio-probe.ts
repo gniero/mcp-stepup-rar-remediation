@@ -5,14 +5,13 @@
  *
  * Spawns `node src/stdio.ts` as a child process (the same server, stdio transport), gets tokens
  * from the AS with the lab-only password grant, and shows:
- *   transfer -> JSON-RPC error -32043 AUTHORIZATION_REQUIRED + remediation
+ *   transfer -> JSON-RPC error -32010 AUTHORIZATION_REQUIRED + remediation
  *   -> one-shot token for exactly those authorization_details
  *   -> retry as a NEW request with _meta {operation_id, access_token} -> success
  *   -> same retry again -> stored result (no second debit)
  */
-import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import { McpError } from "@modelcontextprotocol/sdk/types.js";
+import { Client, ProtocolError } from "@modelcontextprotocol/client";
+import { StdioClientTransport } from "@modelcontextprotocol/client/stdio";
 import { AUTHORIZATION_REQUIRED, META_ACCESS_TOKEN, META_OPERATION_ID } from "./challenge.ts";
 
 const TOKEN_URL = process.env.PROBE_TOKEN_URL ?? "http://idp:8080/token";
@@ -34,7 +33,9 @@ const text = (r: any) => r.content?.map((c: any) => c.text).join(" | ");
 const H = (s: string) => console.log(`\n=== ${s}`);
 
 const session = await token({ scope: "mcp:basic" });
-const client = new Client({ name: "stdio-probe", version: "0" });
+// MCP 2026-07-28: no initialize; the client probes with server/discover and then sends the
+// per-request _meta envelope (protocol version, client capabilities) on every call.
+const client = new Client({ name: "stdio-probe", version: "0" }, { versionNegotiation: { mode: { pin: "2026-07-28" } } });
 await client.connect(
   new StdioClientTransport({
     command: "node",
@@ -54,7 +55,7 @@ try {
   await client.callTool({ name: "transfer", arguments: args });
   throw new Error("expected AUTHORIZATION_REQUIRED");
 } catch (e) {
-  if (!(e instanceof McpError) || e.code !== AUTHORIZATION_REQUIRED) throw e;
+  if (!(e instanceof ProtocolError) || e.code !== AUTHORIZATION_REQUIRED) throw e;
   data = e.data;
   console.log(`code=${e.code} message="${e.message}"`);
   console.log(JSON.stringify(data, null, 2));
