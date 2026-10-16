@@ -4,6 +4,8 @@
 
 Um ambiente com docker compose para validar esta proposta. **Uma ferramenta (tool) MCP descobre _durante a execução_ que a operação precisa de autorização própria e responde com `401` + `WWW-Authenticate: Bearer error="insufficient_authorization", authorization_remediation=…`, conforme definido no [draft-ietf-oauth-rar-metadata-remediation](https://datatracker.ietf.org/doc/draft-ietf-oauth-rar-metadata-remediation/). O cliente retém a requisição em andamento, obtém um token de uso único contendo exatamente os `authorization_details` (RFC 9396) indicados na remediação e reenvia a mesma requisição.** A ferramenta não anuncia o requisito antecipadamente, e a elicitation nunca é o mecanismo de autorização.
 
+Três **bindings** intercambiáveis carregam esse resultado de "autorização necessária": `http` (o 401 acima), `inband` (erro JSON-RPC `-32010`) e **`mrtr`**: um resultado de sucesso do Multi Round-Trip da MCP 2026-07-28, `resultType: "input_required"`, com a remediação em `_meta`. **O cliente escolhe, a cada requisição**: lista as formas in-band que sabe tratar em `capabilities.extensions["lab.stepup/rar-remediation"].bindings`, e o servidor responde com a primeira que oferece; um cliente que não lista nada recebe o 401 interoperável. Veja [Negociação do binding](#negociação-do-binding) e [Semântica da ferramenta](#semântica-da-ferramenta-o-que-o-laboratório-faz-a-respeito).
+
 * **Toda transferência exige um grant `money_transfer`**, cujos `authorization_details` fixam a conta de débito (debtor), o recebedor (chave Pix, creditor) e o valor.
 * **Tokens de uso único (one-shot).** O token da operação **não tem scope** (nenhuma permissão anterior é solicitada de novo), vale 2 minutos e é invalidado pelo servidor MCP (pelo `jti`) quando a operação é efetivada. O agente o usa nesse único reenvio e o descarta.
 * **O token de sessão é preservado.** O token `mcp:basic` obtido no login continua atendendo à consulta de saldos e a todas as outras chamadas. Ele nunca é substituído.
@@ -29,28 +31,40 @@ sequenceDiagram
     M-->>A: 401 WWW-Authenticate: Bearer resource_metadata="…", scope="mcp:basic"
     A->>U: navegador: login + consentimento (mcp:basic)
     K-->>A: token de SESSÃO T1 (scope=mcp:basic), iss verificado (RFC 9207)
-    A->>M: reenvia server/discover (T1) → 200 supportedVersions=[2026-07-28]  (sem sessão)
+    A->>M: reenvia server/discover (T1) → 200 supportedVersions=[2026-07-28], oferece bindings [mrtr, inband]  (sem sessão)
+    Note over A,M: o _meta de toda requisição declara os bindings do cliente, ex. [mrtr, inband] (ou nenhum)
     A->>M: tools/call get_accounts (T1, envelope _meta) → 200
     A->>M: POST tools/call transfer(R$ 800 → carol)  [id=2, T1]
     M->>M: valida (somente leitura) → cria op_X, detalhe = money_transfer{instruction_id: op_X, débito, recebedor, valor}
     M-->>A: 200 resultType=input_required {inputRequests.confirm: elicitation "Pagamento pendente op_X … continuar?", requestState=selado{op_X}}
     U-->>A: sim
     A->>M: nova tentativa tools/call transfer [id=3, T1] + inputResponses + requestState
-    M-->>A: 401 Bearer error="insufficient_authorization", authorization_remediation=b64url({authorization_details:[detalhe]}) (ou JSON-RPC -32010 in-band)
+    alt http (padrão: o cliente não declarou binding)
+        M-->>A: 401 Bearer error="insufficient_authorization", authorization_remediation=b64url({authorization_details:[detalhe]})
+    else inband (o cliente declarou inband)
+        M-->>A: 200 erro JSON-RPC -32010 AUTHORIZATION_REQUIRED, data.authorization_remediation, operation_id=op_X
+    else mrtr (o cliente declarou mrtr)
+        M-->>A: 200 resultType=input_required, requestState=selado{op_X}, _meta.authorization_required.authorization_remediation
+    end
     A->>U: navegador: /authorize?authorization_details=[…]&resource=…  (SEM scope)
     U->>K: aprova "R$ 800,00 · checking → carol@pix.example · ref op_X"
     K-->>A: token de USO ÚNICO T2 (authorization_details com instruction_id op_X, sem scope, 120 s)
-    A->>M: reenvia a MESMA requisição [id=3] com T2
+    alt http
+        A->>M: reenvia a MESMA requisição [id=3] com T2
+    else inband
+        A->>M: NOVO tools/call [id=4], _meta.operation_id=op_X, com T2
+    else mrtr
+        A->>M: NOVO tools/call [id=4] + requestState, com T2
+    end
     M->>M: localiza op_X pelo instruction_id de T2 → reserva (executing + jti gasto) → commit uma única vez
     M-->>A: 200 resultado
     A->>M: tools/call get_accounts (T1 de novo) → 200
     A->>M: mesma transferência de novo (reenvio / mesma idempotency_key) → 200 resultado armazenado, sem débito em dobro
 ```
 
-Diagramas PlantUML detalhados (vínculo com a operação, idempotência, guard), um por binding:
+As três opções só diferem em como a "autorização necessária" é sinalizada e em como o cliente tenta de novo; a autorização em si (token de uso único para exatamente `op_X`) e a execução são iguais. O cliente escolhe a opção a cada requisição ([Negociação do binding](#negociação-do-binding)).
 
-* `docs/stepup-http.puml`: **binding HTTP**, 401 `insufficient_authorization` e reenvio da mesma requisição (renderizado em `.svg` / `.png`).
-* `docs/stepup-stream.puml`: **binding de stream / in-band**, erro JSON-RPC `-32010` e nova tentativa como requisição nova que referencia a operação, via stdio ou Streamable HTTP com `CHALLENGE_BINDING=inband` (renderizado em `.svg` / `.png`).
+O diagrama PlantUML detalhado, `docs/stepup.puml` (renderizado em `.svg` / `.png`), tem o fluxo completo com as três opções lado a lado, stdio, vínculo com a operação, idempotência e o guard.
 
 ---
 
@@ -83,9 +97,9 @@ cp .env.example .env     # coloque sua ANTHROPIC_API_KEY nele
 | `stepup.ts` | Contexto por requisição (AsyncLocalStorage) com o principal autenticado e um espaço para o desafio. `requireAuthorizationDetails(op, detalhe(s))` só passa se o token tiver detalhes idênticos e seu `jti` ainda não tiver sido gasto; então reserva a operação (`executing`) e gasta o `jti` num único passo. Caso contrário, registra um desafio e interrompe a ferramenta. `commit()` envolve os efeitos colaterais; o **guard** se recusa a desafiar depois de um commit. |
 | `operations.ts` | Armazenamento de operações pendentes: checkpoint, status, resultado armazenado, TTL. Localizadas pelo `instruction_id` do token, pelo `requestState` do MRTR, pelo id de operação em `_meta` (nova tentativa in-band) ou pela `idempotency_key`. Não há chave `(sessão, id da requisição)`: a 2026-07-28 não tem sessões, e cada nova tentativa tem um id novo. |
 | `request-state.ts` | O codec do `requestState` do MRTR (`createRequestStateCodec` do SDK): `{op}` selado com HMAC, expira em 10 min e é **vinculado ao `sub` do usuário** (o MUST da especificação para estado que influencia autorização). O servidor o verifica antes de qualquer handler rodar. |
-| `tools.ts` | `transfer`: localiza a operação (veja acima). Na primeira execução, valida (somente leitura) e cria `op_X`. Se o cliente declarou elicitation, devolve **`input_required`** com a confirmação embutida e o `requestState`; o cliente tenta de novo com a resposta. Então exige os detalhes `money_transfer` exatamente desta operação. Autorizada, revalida, efetiva e gasta o token. `naive_batch_transfer` (demo): com um recebedor novo, cadastra o recebedor primeiro (um commit), então o guard devolve um resultado parcial. Com recebedores conhecidos, desafia uma única vez com **N `authorization_details`**, de modo que um consentimento cobre o lote. |
-| `challenge.ts` | A forma **independente de transporte** do desafio: erro JSON-RPC **`AUTHORIZATION_REQUIRED` (-32010)** com `data = {error, error_description, authorization_remediation, resource_metadata, operation_id}`. O -32010 fica na faixa definida pela implementação; a 2026-07-28 reserva -32020…-32099 para a especificação. `inbandHttpResponse()` reescreve uma resposta HTTP JSON; `StdioAuthTransport` envolve o transporte stdio. Também define as chaves `_meta` do laboratório: `lab.stepup/operation_id` (retomar uma operação pendente) e `lab.stepup/access_token` (token de uso único, só em stdio). |
-| `index.ts` | `createMcpHandler` (servidor por requisição, modo de resposta JSON, tráfego da era 2025 rejeitado). Autentica todo POST e, com `CHALLENGE_BINDING=http` (padrão), converte um desafio registrado no 401. O corpo do 401/403 é **RFC 9457 (problem details), não uma resposta JSON-RPC**: um desafio de transporte deixa a requisição sem resposta, então reenviar a mesma requisição é legítimo. Com `CHALLENGE_BINDING=inband`, o resultado JSON-RPC vira o erro `-32010`. Um token de uso único só é aceito em um `tools/call` de pagamento; qualquer outra coisa recebe `403 insufficient_scope`. |
+| `tools.ts` | `transfer`: localiza a operação (veja acima). Na primeira execução, valida (somente leitura) e cria `op_X`. Se o cliente declarou elicitation, devolve **`input_required`** com a confirmação embutida e o `requestState`; o cliente tenta de novo com a resposta. Então exige os detalhes `money_transfer` exatamente desta operação (`authorizationStep()`: a falta de concessão é respondida na forma **negociada**: um resultado `input_required` com um `requestState` selado para `mrtr`; caso contrário, o desafio de transporte, 401 ou `-32010`). Autorizada, revalida, efetiva e gasta o token. `naive_batch_transfer` (demo): com um recebedor novo, cadastra o recebedor primeiro (um commit), então o guard devolve um resultado parcial. Com recebedores conhecidos, desafia uma única vez com **N `authorization_details`**, de modo que um consentimento cobre o lote. |
+| `challenge.ts` | Os três bindings. A forma de **erro independente de transporte** do desafio: erro JSON-RPC **`AUTHORIZATION_REQUIRED` (-32010)** com `data = {error, error_description, authorization_remediation, resource_metadata, operation_id}`. O -32010 fica na faixa definida pela implementação; a 2026-07-28 reserva -32020…-32099 para a especificação. `inbandHttpResponse()` reescreve uma resposta HTTP JSON; `StdioAuthTransport` envolve o transporte stdio. A forma **MRTR** (`authorizationRequiredData()`) coloca os mesmos dados em `_meta["lab.stepup/authorization_required"]` de um resultado; `chooseBinding()` faz a [negociação](#negociação-do-binding): a política do servidor (`CHALLENGE_BINDING`) e os `OFFERED_BINDINGS` (anunciados no `server/discover`) contra `capabilities.extensions["lab.stepup/rar-remediation"].bindings` do cliente. Também define as chaves `_meta` do laboratório: `lab.stepup/operation_id` (retomar uma operação pendente) e `lab.stepup/access_token` (token de uso único, só em stdio). |
+| `index.ts` | `createMcpHandler` (servidor por requisição, modo de resposta JSON, tráfego da era 2025 rejeitado). Autentica todo POST e converte um desafio registrado no 401 (a forma negociada `http`, o padrão). O corpo do 401/403 é **RFC 9457 (problem details), não uma resposta JSON-RPC**: um desafio de transporte deixa a requisição sem resposta, então reenviar a mesma requisição é legítimo. Quando a forma negociada é `inband`, o resultado JSON-RPC vira o erro `-32010`. Um token de uso único só é aceito em um `tools/call` de pagamento; qualquer outra coisa recebe `403 insufficient_scope`. |
 | `stdio.ts` | O mesmo servidor via **stdio** (`serveStdio`, que negocia a era com `server/discover`). O token de sessão vem de `MCP_ACCESS_TOKEN`, os desafios são sempre in-band e o token de uso único chega em `_meta`. |
 | `stdio-probe.ts` | Demonstração via stdio sem navegador: `-32010` → token de uso único → nova tentativa com `_meta` → resultado armazenado na duplicata → token de uso único recusado em ferramenta que não é de pagamento. |
 
@@ -94,10 +108,10 @@ cp .env.example .env     # coloque sua ANTHROPIC_API_KEY nele
 | Arquivo | O que faz |
 |---|---|
 | `stepup-fetch.ts` | A metade cliente. **401 / 403 insufficient_scope** → (re)obtém o token de **sessão**, reenvia e continua usando-o. **401 insufficient_authorization** → decodifica o `authorization_remediation`, obtém um token de **uso único**, reenvia **apenas esta requisição** com ele e o descarta. Se o reenvio falhar de novo, o caso não é remediável e o cliente para (draft §7.1 passo 4, §7.3.3). Se o usuário **recusar** (ou a remediação for impossível), o `tools/call` é respondido localmente com um `CallToolResult` com **`isError: true`** ("o usuário recusou… não tente de novo"), e não com um erro de transporte, então o modelo vê um resultado de ferramenta e não entra em loop. |
-| `inband.ts` | `callToolWithAuthorization()`: ao receber o erro JSON-RPC **-32010**, executa a mesma autorização de uso único e **tenta de novo como um novo `tools/call`** com `_meta["lab.stepup/operation_id"]`. O servidor retoma o checkpoint, sem uma segunda confirmação. O token de uso único é anexado exatamente a essa requisição (`oauth.armOneShot`). Uma recusa também vira um resultado `isError`. |
+| `call-tool.ts` | `callToolWithAuthorization()`, o driver de chamadas de ferramenta, no **modo MRTR manual** do SDK (`allowInputRequired`). Num `input_required` com `inputRequests`, responde com o handler de elicitation e tenta de novo com `inputResponses` + `requestState`. Num `input_required` com a **dica `lab.stepup/authorization_required`**, executa a autorização de uso único e tenta de novo ecoando o `requestState`. No erro JSON-RPC **-32010**, executa a mesma autorização e **tenta de novo como um novo `tools/call`** com `_meta["lab.stepup/operation_id"]`. O token de uso único é anexado exatamente a essa nova tentativa (`oauth.armOneShot`, casado pelo `requestState` ou pelo id da operação). Uma autorização nova por chamada; uma recusa vira um resultado `isError`. |
 | `oauth.ts` | Discovery (PRM → metadados do AS, verificação do issuer, verificação de `authorization_details_types_supported`). Valida o `iss` na resposta de autorização (RFC 9207; MUST para clientes MCP 2026-07-28). O fluxo authorization code + PKCE + `resource` é compartilhado pelo grant de sessão (`scope=…`) e pelo grant de operação (`authorization_details=…`, **sem scope**). O token de sessão nunca é sobrescrito por um token de operação. |
 | `elicitation.ts` | Elicitation de formulário no terminal (`Y/n/c`). Na 2026-07-28 o servidor a embute num resultado `input_required`; o driver multi-round-trip do SDK chama este handler e repete a chamada com a resposta. |
-| `index.ts` | Conecta ao MCP fixado na 2026-07-28 (`server/discover`, sem `initialize`) e liga o `callToolWithAuthorization` ao loop do LLM. Declara a capability de elicitation, com timeout de 5 min para requisições retidas. |
+| `index.ts` | Conecta ao MCP fixado na 2026-07-28 (`server/discover`, sem `initialize`) e liga o `callToolWithAuthorization` ao loop do LLM. Declara a capability de elicitation e a extensão `lab.stepup/rar-remediation` com os `bindings` de `AGENT_BINDINGS` (padrão `mrtr,inband`; vazio = não declara nada e recebe o 401), com timeout de 5 min para requisições retidas. |
 | `llm.ts` | Drivers de LLM: `anthropic` (Claude) e `openai` (qualquer servidor compatível com OpenAI, por exemplo um modelo local no Ollama). Veja [Rodando com um LLM local](#rodando-com-um-llm-local). |
 
 ## Passo 4: execute
@@ -114,9 +128,14 @@ docker compose run --build --rm --service-ports agent
 **Variantes:**
 
 ```bash
-# O mesmo fluxo com o binding in-band via HTTP (erro JSON-RPC -32010 em vez de 401):
-CHALLENGE_BINDING=inband docker compose up -d --build mcp-server
-docker compose run --build --rm --service-ports agent
+# O servidor negocia por padrão (CHALLENGE_BINDING=negotiate); o agente escolhe a forma:
+docker compose run --build --rm --service-ports agent                          # mrtr (1ª escolha dele)
+AGENT_BINDINGS=inband docker compose run --build --rm --service-ports agent    # erro JSON-RPC -32010
+AGENT_BINDINGS= docker compose run --build --rm --service-ports agent          # não declara nada: 401
+bash scripts/probe-bindings.sh   # prova via HTTP puro da negociação e do binding MRTR
+
+# Ou fixe a forma no servidor, para todos os clientes:
+CHALLENGE_BINDING=http docker compose up -d mcp-server     # sempre 401 (também: inband, mrtr)
 
 # O mesmo servidor via stdio (lá, in-band é a única opção):
 docker compose run --rm mcp-server node src/stdio-probe.ts
@@ -134,6 +153,8 @@ O `probe.sh` mostra:
 8. Duas requisições novas com a mesma `idempotency_key` compartilham uma operação (mesmo `instruction_id`). Uma terceira devolve o resultado armazenado sem nova autorização, e a mesma chave com outro valor é recusada.
 9. O lote ingênuo aciona o guard.
 10. A consulta de saldos continua funcionando com o token de sessão: só as duas transferências aprovadas foram debitadas.
+
+O `probe-bindings.sh` mostra: as formas oferecidas, anunciadas no `server/discover`; a mesma transferência de quatro clientes: quem não declara nada recebe o **401**, `[inband]` recebe **`-32010`**, `[mrtr, inband]` recebe **`input_required`** (a primeira escolha), uma forma desconhecida recebe o 401; depois o fluxo MRTR de ponta a ponta: **200 `input_required`** com `requestState` e a remediação em `_meta`; uma nova tentativa sem token recebe o mesmo passo de novo; a tentativa com `requestState` + o token de uso único executa uma vez, e de novo devolve o resultado armazenado; um `requestState` adulterado é rejeitado com `-32602` antes de a ferramenta rodar; um `requestState` numa chamada com outros argumentos é recusado.
 
 No REPL do agente (pode escrever em português):
 
@@ -157,7 +178,8 @@ Logs: `docker compose logs -f idp mcp-server` mostra `[consent]`, `[token]` (sco
 7. **Lote.** Uma única remediação pode carregar N `authorization_details`, então um consentimento e um token cobrem N transferências.
 8. **Elicitation versus desafios HTTP.** Na 2026-07-28 a confirmação é uma rodada MRTR (`input_required` + `requestState`), então se encaixa naturalmente no modo de resposta JSON. A elicitation continua sendo só UX; a autorização vem do AS. O 401 continua sendo um erro de transporte: o MRTR não tem um tipo de input para "obtenha um token com estes `authorization_details`" (isso seria uma extensão).
 9. **Timeouts.** Uma requisição retida espera por uma pessoa, então o padrão de 60 s do SDK é curto demais.
-10. **Clientes da era 2025 são rejeitados.** O SDK consegue atender clientes 2025 sem estado, mas essa via responde por SSE, que confirma um `200` antes de a ferramenta rodar e não conseguiria levar o 401 no meio da ferramenta. O servidor usa `legacy: "reject"` (`-32022` UnsupportedProtocolVersion).
+10. **"Autorização necessária" não precisa ser um erro.** Com MRTR (`mrtr` negociado) é um resultado `input_required` de sucesso, então a chamada da ferramenta continua sendo uma única operação lógica entre as rodadas, e o id da operação viaja no `requestState` selado. Hoje isso exige uma extensão do laboratório, então o cliente informa quais formas sabe tratar e o servidor usa o 401 para todos os demais ([Negociação do binding](#negociação-do-binding)).
+11. **Clientes da era 2025 são rejeitados.** O SDK consegue atender clientes 2025 sem estado, mas essa via responde por SSE, que confirma um `200` antes de a ferramenta rodar e não conseguiria levar o 401 no meio da ferramenta. O servidor usa `legacy: "reject"` (`-32022` UnsupportedProtocolVersion).
 
 ## Rodando com um LLM local
 
@@ -212,23 +234,47 @@ Os passos 5–8 do `probe.sh` demonstram cada caso: duas transferências idênti
 
 O desafio é modelado como um único resultado abstrato: **"autorização necessária para estes `authorization_details`; nada foi executado"**. Cada transporte o carrega à sua maneira:
 
-| | Binding HTTP (`401`) | Binding in-band (`-32010`) |
-|---|---|---|
-| A requisição JSON-RPC foi respondida? | **Não.** O corpo é problem details, não uma resposta JSON-RPC | **Sim**, com um erro JSON-RPC |
-| Como o cliente continua | Reenvia a **mesma** requisição (mesmo id, mesmo corpo, incluindo o `requestState`) | Envia um **novo** `tools/call` com `_meta["lab.stepup/operation_id"]` |
-| Como o servidor retoma | Operação indicada pelo `instruction_id` do token (e pelo `requestState`) | Operação indicada pelo `_meta` e pelo `instruction_id` do token |
-| Onde vai o token de uso único | Header `Authorization` | Header `Authorization` (HTTP) ou `_meta["lab.stepup/access_token"]` (stdio) |
-| Transportes | Só Streamable HTTP | Qualquer um (HTTP, stdio) |
+| | Binding HTTP (`401`) | Binding in-band (`-32010`) | Binding MRTR (`input_required`) |
+|---|---|---|---|
+| A requisição JSON-RPC foi respondida? | **Não.** O corpo é problem details, não uma resposta JSON-RPC | **Sim**, com um erro JSON-RPC | **Sim**, com um resultado de sucesso (`resultType: "input_required"`) |
+| É um erro? | Erro de transporte | Erro de protocolo | **Não.** Um passo que o cliente executa |
+| Onde vai a remediação | `WWW-Authenticate` (`authorization_remediation`, base64url) | `error.data` | `result._meta["lab.stepup/authorization_required"]` |
+| Como o cliente continua | Reenvia a **mesma** requisição (mesmo id, mesmo corpo, incluindo o `requestState`) | Envia um **novo** `tools/call` com `_meta["lab.stepup/operation_id"]` | Tenta de novo (id novo) ecoando o **`requestState`** |
+| Como o servidor retoma | Operação indicada pelo `instruction_id` do token (e pelo `requestState`) | Operação indicada pelo `_meta` e pelo `instruction_id` do token | Operação indicada pelo `requestState` e pelo `instruction_id` do token |
+| Onde vai o token de uso único | Header `Authorization` | Header `Authorization` (HTTP) ou `_meta["lab.stepup/access_token"]` (stdio) | Igual ao in-band |
+| Transportes | Só Streamable HTTP | Qualquer um (HTTP, stdio) | Qualquer um (HTTP, stdio) |
+| Quem recebe | Qualquer cliente (o padrão) | Clientes que declaram `inband` | Clientes que declaram `mrtr` |
 
-Nos dois bindings, **uma recusa do usuário é um resultado de ferramenta** (`isError: true`), e o guard mantém a promessa de que "nada foi executado". O código `-32010` e as chaves `_meta` são definidos pelo laboratório (a 2026-07-28 reserva -32020…-32099 para a especificação, então um código do laboratório fica na faixa da implementação). Padronizá-los faz parte da proposta.
+Nos três, **uma recusa do usuário é um resultado de ferramenta** (`isError: true`), e o guard mantém a promessa de que "nada foi executado". O código `-32010`, as chaves `_meta` e a extensão são definidos pelo laboratório (a 2026-07-28 reserva -32020…-32099 para a especificação, então um código do laboratório fica na faixa da implementação). Padronizá-los faz parte da proposta.
 
-A confirmação antes da autorização é o passo **sem erro** da 2026-07-28 (`resultType: "input_required"`), nos dois bindings.
+A confirmação antes da autorização é o passo **sem erro** da 2026-07-28 (`resultType: "input_required"` com uma elicitation embutida), em todos os bindings. Com `mrtr` o passo de autorização se junta a ela: uma chamada vira até três rodadas (confirmar → autorizar → executar), todas resultados de sucesso.
+
+### Negociação do binding
+
+As formas in-band só são entendidas por clientes que conhecem as convenções deste laboratório, então **o cliente informa quais sabe tratar**, e o servidor nunca envia uma forma que o cliente não pediu:
+
+```jsonc
+// _meta de toda requisição (a MCP 2026-07-28 envia as capabilities do cliente em cada requisição)
+"io.modelcontextprotocol/clientCapabilities": {
+  "elicitation": { "form": {} },
+  "extensions": { "lab.stepup/rar-remediation": { "bindings": ["mrtr", "inband"] } }   // ordem de preferência
+}
+// resultado do server/discover: o que este servidor oferece
+"capabilities": { "extensions": { "lab.stepup/rar-remediation": { "bindings": ["mrtr", "inband"] } } }
+```
+
+O servidor responde com a primeira preferência do cliente que ele oferece. Um cliente que não declara nada, ou nada em comum, recebe o **401** (no stdio, que não tem status HTTP, o `-32010`). Declarar a extensão sem `bindings` equivale a `["mrtr"]`. Como as capabilities vão em toda requisição, a decisão é por requisição, não por conexão; o log do servidor a mostra (`authorization required -> binding mrtr (client prefers [...], server offers [...])`).
+
+`CHALLENGE_BINDING` é a **política do servidor**: `negotiate` (padrão; oferece `mrtr` e `inband`), `mrtr` (oferece só `mrtr`), `http` (sempre 401) ou `inband` (sempre `-32010`, sem negociação). No agente, `AGENT_BINDINGS` define a lista declarada.
+
+Por que é preciso negociar. Os tipos de input do MRTR são elicitation, sampling e roots; não há um para "obter um access token com estes `authorization_details`". Então o passo de autorização MRTR é um `input_required` só com `requestState` e uma dica em `_meta`. A especificação permite que o cliente repita um resultado assim imediatamente, então um cliente que não entende a dica ficaria em loop até o limite de rodadas; um que não conhece o `-32010` veria um erro de protocolo sem explicação. Declarar a forma é o cliente dizendo "eu executo o fluxo OAuth para isso". Uma versão padronizada seria uma dica de remediação de autorização no estilo da SEP-2643, ou um novo tipo de input request.
 
 ## Solução de problemas
 
 * **`invalid_authorization_details` vindo do AS.** Os detalhes não seguem o schema `money_transfer`. Veja `GET http://localhost:8080/authorization-details-types`.
 * **O navegador diz "Unknown or already used state".** Você abriu uma URL de autorização antiga. Use a última que o agente imprimiu.
 * **`Unsupported protocol version` (`-32022`) ou `Version negotiation failed`.** Cliente e servidor precisam falar 2026-07-28. O servidor rejeita tráfego da era 2025 (`initialize`); reconstrua uma imagem antiga do agente (`docker compose run --build …`).
+* **O agente recebe um 401 embora devesse negociar.** Veja a linha `authorization required -> binding …` no log do servidor: a política do servidor (`CHALLENGE_BINDING`) pode não oferecer o que `AGENT_BINDINGS` declara, ou a imagem do agente está desatualizada (a mensagem de inicialização precisa listar `in-band forms declared`).
 * **`Invalid or expired requestState`.** Uma nova tentativa MRTR voltou depois de mais de 10 minutos, com o token de outro usuário ou depois de o servidor reiniciar (a chave HMAC é por processo, a menos que `REQUEST_STATE_KEY` esteja definida). Comece a transferência de novo.
 * **`invalid_token` depois de reiniciar o `idp`.** O AS gera uma nova chave de assinatura ao iniciar. Reinicie o agente para que ele faça login de novo.
 * **O agente pede `scope=mcp:basic` em vez dos `authorization_details` numa transferência.** Você está rodando uma imagem antiga do agente. O serviço `agent` fica atrás de um profile, então `docker compose up --build` **não** o reconstrói, e `docker compose run` reaproveita a imagem antiga. Sempre inicie com `docker compose run --build …` (ou rode `docker compose --profile agent build`). A mensagem de inicialização precisa mencionar `agent (MCP 2026-07-28)`.

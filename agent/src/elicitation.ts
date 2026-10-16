@@ -1,20 +1,20 @@
 /**
- * Client-side form elicitation handler. The server uses it right before a step-up
+ * Client-side form elicitation in the terminal. The server uses it right before a step-up
  * challenge to show the user what is pending and get their intent, so the browser
  * redirect that follows is not a surprise.
  *
  * MCP 2026-07-28: the server no longer sends elicitation/create as a request. It returns an
- * `input_required` result embedding it (MRTR); the SDK's multi-round-trip driver dispatches the
- * embedded request to this same handler and retries the call with the answer.
+ * `input_required` result embedding it (MRTR); the call driver (call-tool.ts) hands each embedded
+ * request to this handler and retries the call with the answer in `inputResponses`.
  */
-import type { Client, ElicitResult } from "@modelcontextprotocol/client";
+import type { Client, ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
 import { log } from "./log.ts";
 
 export type Ask = (question: string) => Promise<string>;
+export type ElicitationHandler = (params: ElicitRequest["params"]) => Promise<ElicitResult>;
 
-export function registerElicitation(client: Client, ask: Ask) {
-  client.setRequestHandler("elicitation/create", async (req): Promise<ElicitResult> => {
-    const p = req.params;
+export function elicitationHandler(ask: Ask): ElicitationHandler {
+  return async (p) => {
     if (p.mode === "url") return { action: "decline" }; // not used in this lab
     log.elicit(`server asks:\n${p.message.replace(/^/gm, "   ")}`);
 
@@ -33,5 +33,10 @@ export function registerElicitation(client: Client, ask: Ask) {
     }
     log.elicit(`answering accept ${JSON.stringify(content)}`);
     return { action: "accept", content };
-  });
+  };
+}
+
+/** Also register it the standard way, for MRTR rounds on requests other than tools/call. */
+export function registerElicitation(client: Client, handler: ElicitationHandler) {
+  client.setRequestHandler("elicitation/create", (req) => handler(req.params));
 }

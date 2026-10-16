@@ -20,12 +20,17 @@ export const config = {
   /** Registers `naive_batch_transfer`, a deliberately badly-ordered tool that trips the commit guard (with new payees). */
   demoUnsafeTool: env("DEMO_UNSAFE_TOOL", "true") === "true",
   /**
-   * How a mid-tool authorization challenge is carried over Streamable HTTP:
-   *  - "http":   401 + WWW-Authenticate insufficient_authorization (RAR remediation draft). Default.
-   *  - "inband": JSON-RPC error AUTHORIZATION_REQUIRED (-32043) with the same remediation data,
-   *              i.e. the transport-independent form (the only one available over stdio).
+   * Server POLICY for how a mid-tool authorization challenge is carried (see challenge.ts).
+   * The three forms: "http" (401 insufficient_authorization; Streamable HTTP only), "inband"
+   * (JSON-RPC error -32010), "mrtr" (a successful `input_required` result).
+   *  - "negotiate" (default): the client picks. A client that declares the lab extension with
+   *              {bindings: [...]} gets its first preference the server allows (mrtr, inband);
+   *              any other client gets "http" (on stdio, which has no 401: "inband").
+   *  - "mrtr":   negotiate, but only "mrtr" is offered.
+   *  - "http":   always 401, no negotiation (stdio: "inband").
+   *  - "inband": always -32010, no negotiation.
    */
-  challengeBinding: env("CHALLENGE_BINDING", "http") as "http" | "inband",
+  challengeBinding: env("CHALLENGE_BINDING", "negotiate") as "negotiate" | "http" | "inband" | "mrtr",
   /** Informational only (shown to the user): transfers above this amount are flagged as high value. */
   riskAmountThreshold: Number(env("RISK_AMOUNT_THRESHOLD", "500")),
 };

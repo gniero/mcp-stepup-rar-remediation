@@ -4,12 +4,32 @@
  * The abstract outcome is "AUTHORIZATION REQUIRED for these authorization_details; nothing was
  * executed". Each binding carries it in its own way:
  *
- *  - Streamable HTTP, binding "http" (default): 401 + WWW-Authenticate insufficient_authorization
+ *  - Streamable HTTP, binding "http": 401 + WWW-Authenticate insufficient_authorization
  *    (draft-ietf-oauth-rar-metadata-remediation). No JSON-RPC response exists for the request; the
  *    client replays the SAME request with the one-shot token. See index.ts.
- *  - Any transport, binding "inband" (and always over stdio): a JSON-RPC error response with code
+ *  - Any transport, binding "inband" (and the stdio fallback): a JSON-RPC error response with code
  *    AUTHORIZATION_REQUIRED carrying the same remediation. The request IS answered, so the client
  *    retries as a NEW request that references the pending operation in `_meta`.
+ *  - Any transport, binding "mrtr" (MCP 2026-07-28 Multi Round-Trip Requests): NOT an error. The
+ *    tool returns `resultType: "input_required"` with a sealed `requestState` naming the operation
+ *    and the remediation in `_meta["lab.stepup/authorization_required"]`; there are no
+ *    `inputRequests` (MRTR has no input type for "obtain an access token"). The client gets the
+ *    one-shot token and retries the call with the echoed `requestState`, the token in the
+ *    Authorization header (stdio: `_meta["lab.stepup/access_token"]`).
+ *
+ * Negotiation (CHALLENGE_BINDING=negotiate, the default): the in-band forms are only understood by
+ * clients that know this lab's extension, so the CLIENT discloses which ones it handles, per request
+ * (MCP 2026-07-28 sends client capabilities in every request's _meta):
+ *
+ *   capabilities.extensions["lab.stepup/rar-remediation"] = { bindings: ["mrtr", "inband"] }
+ *
+ * in order of preference. The server answers with the first one its policy allows and advertises
+ * that policy on server/discover (same extension key, `bindings` = what it offers). A client that
+ * declares nothing, or nothing the server offers, gets the interoperable default: the 401 (stdio:
+ * -32010, since stdio has no HTTP status). The extension declared without `bindings` means ["mrtr"].
+ * Without negotiation a client that ignored the MRTR hint would just retry (the spec lets a client
+ * retry a requestState-only result immediately) and loop until its round cap; one that does not
+ * know -32010 would see an unexplained protocol error.
  *
  * Lab-defined protocol extension (not part of MCP):
  *   error.code   = -32010  (MCP 2026-07-28 reserves -32020..-32099 for the spec; -32000..-32019 is
@@ -19,9 +39,13 @@
  *   request _meta "lab.stepup/operation_id"  -> resume this pending operation
  *   request _meta "lab.stepup/access_token"  -> one-shot token, ONLY on transports without an
  *                                               Authorization header (stdio)
+ *   capabilities.extensions "lab.stepup/rar-remediation" {bindings} -> client: forms it handles, in
+ *                                                    preference order; server: forms it offers
+ *   result _meta "lab.stepup/authorization_required"  -> the MRTR authorization step (same data as
+ *                                                        the -32010 error.data)
  */
 import { isJSONRPCRequest, type JSONRPCMessage, type Transport } from "@modelcontextprotocol/server";
-import { prmUrl } from "./config.ts";
+import { config, prmUrl } from "./config.ts";
 import { newRequestContext, requestContext, type Challenge } from "./stepup.ts";
 import type { Principal } from "./auth.ts";
 
@@ -30,6 +54,48 @@ export const AUTHORIZATION_REQUIRED = -32010;
 export const PAYMENT_TOOLS = new Set(["transfer", "naive_batch_transfer"]);
 export const META_OPERATION_ID = "lab.stepup/operation_id";
 export const META_ACCESS_TOKEN = "lab.stepup/access_token";
+/** Extension a client declares (capabilities.extensions) to receive the MRTR authorization step. */
+export const EXTENSION_ID = "lab.stepup/rar-remediation";
+export const META_AUTHORIZATION_REQUIRED = "lab.stepup/authorization_required";
+
+export type Binding = "http" | "inband" | "mrtr";
+type NegotiableBinding = Exclude<Binding, "http">;
+
+/** In-band forms this server offers to clients that negotiate (advertised on server/discover). */
+export const OFFERED_BINDINGS: NegotiableBinding[] =
+  config.challengeBinding === "negotiate" ? ["mrtr", "inband"] : config.challengeBinding === "mrtr" ? ["mrtr"] : [];
+
+/** Forms the client declared in capabilities.extensions, in its preference order (undefined: none). */
+export function declaredBindings(caps: { extensions?: Record<string, unknown> } | undefined): string[] | undefined {
+  const ext = caps?.extensions?.[EXTENSION_ID] as { bindings?: unknown } | undefined;
+  if (!ext) return undefined;
+  return Array.isArray(ext.bindings) ? ext.bindings.filter((b): b is string => typeof b === "string") : ["mrtr"];
+}
+
+/**
+ * How to answer "authorization required" for this request: the server policy, then the client's
+ * declared preferences. "http" means the transport's own challenge (401; stdio: -32010).
+ */
+export function chooseBinding(caps: { extensions?: Record<string, unknown> } | undefined): { binding: Binding; why: string } {
+  if (config.challengeBinding === "http") return { binding: "http", why: "server policy: http" };
+  if (config.challengeBinding === "inband") return { binding: "inband", why: "server policy: inband" };
+  const declared = declaredBindings(caps);
+  if (!declared) return { binding: "http", why: `client did not declare ${EXTENSION_ID}` };
+  const pick = declared.find((b): b is NegotiableBinding => (OFFERED_BINDINGS as string[]).includes(b));
+  if (!pick) return { binding: "http", why: `client offers [${declared.join(", ")}], server offers [${OFFERED_BINDINGS.join(", ")}]` };
+  return { binding: pick, why: `client prefers [${declared.join(", ")}], server offers [${OFFERED_BINDINGS.join(", ")}]` };
+}
+
+/** The remediation payload, shared by the -32010 error data and the MRTR `_meta` hint. */
+export function authorizationRequiredData(ch: Challenge) {
+  return {
+    error: "insufficient_authorization",
+    error_description: `Additional authorization is required: ${ch.reason}`,
+    authorization_remediation: { authorization_details: ch.authorizationDetails },
+    resource_metadata: prmUrl,
+    operation_id: ch.operationId,
+  };
+}
 
 export function authorizationRequiredError(id: string | number, ch: Challenge): JSONRPCMessage {
   return {
@@ -38,13 +104,7 @@ export function authorizationRequiredError(id: string | number, ch: Challenge): 
     error: {
       code: AUTHORIZATION_REQUIRED,
       message: "Authorization required",
-      data: {
-        error: "insufficient_authorization",
-        error_description: `Additional authorization is required: ${ch.reason}`,
-        authorization_remediation: { authorization_details: ch.authorizationDetails },
-        resource_metadata: prmUrl,
-        operation_id: ch.operationId,
-      },
+      data: authorizationRequiredData(ch),
     },
   } as JSONRPCMessage;
 }
