@@ -64,7 +64,7 @@ sequenceDiagram
 
 As três opções só diferem em como a "autorização necessária" é sinalizada e em como o cliente tenta de novo; a autorização em si (token de uso único para exatamente `op_X`) e a execução são iguais. O cliente escolhe a opção a cada requisição ([Negociação do binding](#negociação-do-binding)).
 
-O diagrama PlantUML detalhado, `docs/stepup.puml` (renderizado em `.svg` / `.png`), tem o fluxo completo com as três opções lado a lado, stdio, vínculo com a operação, idempotência e o guard.
+`docs/components.svg` (`.png`) mostra os componentes e suas responsabilidades. O diagrama PlantUML detalhado, `docs/stepup.puml` (renderizado em `.svg` / `.png`), tem o fluxo completo com as três opções lado a lado, stdio, vínculo com a operação, idempotência e o guard.
 
 ---
 
