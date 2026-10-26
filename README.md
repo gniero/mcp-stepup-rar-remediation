@@ -64,7 +64,7 @@ sequenceDiagram
 
 The three options differ only in how "authorization required" is signalled and how the client retries; the authorization itself (one-shot token for exactly `op_X`) and the execution are the same. The client picks the option per request ([Binding negotiation](#binding-negotiation)).
 
-The detailed PlantUML diagram, `docs/stepup.puml` (rendered `.svg` / `.png`), has the whole flow with the three options side by side, stdio, operation binding, idempotency and the guard.
+`docs/components.svg` (`.png`) shows the components and their responsibilities. The detailed PlantUML diagram, `docs/stepup.puml` (rendered `.svg` / `.png`), has the whole flow with the three options side by side, stdio, operation binding, idempotency and the guard.
 
 ---
 
